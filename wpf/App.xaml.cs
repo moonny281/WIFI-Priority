@@ -14,7 +14,7 @@ namespace WifiPriority
     {
         public static AppSettings Settings;
         public static SwitchEngine Engine;
-        public static MainWindow Main;
+        public static MainWindow MainWin;
         public static OverlayWindow Overlay;
         public static TrayService Tray;
         public static bool Exiting;
@@ -94,7 +94,7 @@ namespace WifiPriority
                 if (Settings.Notify) Tray?.Balloon("已切换 WiFi", $"{f ?? "未连接"} → {t}\n{reason}");
             }));
 
-            Main = new MainWindow();
+            MainWin = new MainWindow();
             Overlay = new OverlayWindow(Settings);
 
             Tray = new TrayService();
@@ -144,9 +144,9 @@ namespace WifiPriority
 
         public static void ShowMain()
         {
-            Main.Show();
-            if (Main.WindowState == WindowState.Minimized) Main.WindowState = WindowState.Normal;
-            Main.Activate();
+            MainWin.Show();
+            if (MainWin.WindowState == WindowState.Minimized) MainWin.WindowState = WindowState.Normal;
+            MainWin.Activate();
         }
 
         public static void ExitApp()
@@ -155,7 +155,7 @@ namespace WifiPriority
             try { Engine?.Stop(); } catch { }
             try { Tray?.Dispose(); } catch { }
             try { Overlay?.Close(); } catch { }
-            try { Main?.Close(); } catch { }
+            try { MainWin?.Close(); } catch { }
             Current.Shutdown();
         }
     }
