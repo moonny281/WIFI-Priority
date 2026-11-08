@@ -1,0 +1,13 @@
+# .NET
+bin/
+obj/
+out/
+dist/
+.vs/
+*.user
+*.suo
+
+# Tauri / Node（以后加 tauri/ 用）
+node_modules/
+tauri/src-tauri/target/
+tauri/dist/
