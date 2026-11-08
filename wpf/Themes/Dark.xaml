@@ -1,0 +1,22 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <!-- 深色「墨夜」：石墨蓝黑底 + 青蓝强调色，信号色用柔和的绿/琥珀/珊瑚 -->
+    <SolidColorBrush x:Key="WindowTint" Color="#D90F1218"/>
+    <SolidColorBrush x:Key="WindowSolid" Color="#0F1218"/>
+    <SolidColorBrush x:Key="CardBg" Color="#B3171B24"/>
+    <SolidColorBrush x:Key="CardBorder" Color="#1AFFFFFF"/>
+    <SolidColorBrush x:Key="TextPrimary" Color="#E6E9F0"/>
+    <SolidColorBrush x:Key="TextSecondary" Color="#8A93A6"/>
+    <SolidColorBrush x:Key="Accent" Color="#4CC2FF"/>
+    <SolidColorBrush x:Key="OnAccent" Color="#04202E"/>
+    <SolidColorBrush x:Key="ControlBg" Color="#14FFFFFF"/>
+    <SolidColorBrush x:Key="ControlHover" Color="#22FFFFFF"/>
+    <SolidColorBrush x:Key="ControlBorder" Color="#29FFFFFF"/>
+    <SolidColorBrush x:Key="NavSelected" Color="#1FFFFFFF"/>
+    <SolidColorBrush x:Key="TrackBg" Color="#33FFFFFF"/>
+    <SolidColorBrush x:Key="Good" Color="#3DDC97"/>
+    <SolidColorBrush x:Key="Warn" Color="#FFC857"/>
+    <SolidColorBrush x:Key="Bad" Color="#FF6B6B"/>
+    <SolidColorBrush x:Key="OverlayBg" Color="#F2161A23"/>
+    <SolidColorBrush x:Key="OverlayBorder" Color="#33FFFFFF"/>
+</ResourceDictionary>

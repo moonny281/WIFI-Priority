@@ -1,0 +1,22 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <!-- 云母白：半透明白叠在 Mica 上，卡片是更白的磨砂层 -->
+    <SolidColorBrush x:Key="WindowTint" Color="#99F7F9FC"/>
+    <SolidColorBrush x:Key="WindowSolid" Color="#F3F5F9"/>
+    <SolidColorBrush x:Key="CardBg" Color="#D9FFFFFF"/>
+    <SolidColorBrush x:Key="CardBorder" Color="#14000000"/>
+    <SolidColorBrush x:Key="TextPrimary" Color="#1B1F27"/>
+    <SolidColorBrush x:Key="TextSecondary" Color="#667085"/>
+    <SolidColorBrush x:Key="Accent" Color="#0A6CFF"/>
+    <SolidColorBrush x:Key="OnAccent" Color="#FFFFFF"/>
+    <SolidColorBrush x:Key="ControlBg" Color="#0D000000"/>
+    <SolidColorBrush x:Key="ControlHover" Color="#1A000000"/>
+    <SolidColorBrush x:Key="ControlBorder" Color="#1F000000"/>
+    <SolidColorBrush x:Key="NavSelected" Color="#14000000"/>
+    <SolidColorBrush x:Key="TrackBg" Color="#26000000"/>
+    <SolidColorBrush x:Key="Good" Color="#12B76A"/>
+    <SolidColorBrush x:Key="Warn" Color="#F79009"/>
+    <SolidColorBrush x:Key="Bad" Color="#F04438"/>
+    <SolidColorBrush x:Key="OverlayBg" Color="#F5FFFFFF"/>
+    <SolidColorBrush x:Key="OverlayBorder" Color="#1F000000"/>
+</ResourceDictionary>
