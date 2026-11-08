@@ -1,0 +1,248 @@
+name: release
+
+# 版本号唯一来源：仓库根目录的 VERSION 文件（例如 1.1.0）。
+#   - 推送到 main/master：读取 VERSION → 构建所有应用 → 如果 v<VERSION> 这个 tag 还不存在，就自动创建 Release 并上传产物
+#     （不改版本号再推送 = 只构建、不发布，产物在 Actions 的 Artifacts 里）
+#   - 推送 v* 标签：以标签为准的版本号构建并发布
+#   - 手动运行（workflow_dispatch）：可选择是否发布
+#   - Pull Request：只构建，不发布
+# 应用：wpf/ 下的 WPF 版本始终构建；以后把 Tauri 项目放到 tauri/（含 tauri/src-tauri/tauri.conf.json），
+#       流水线会自动检测到并一起构建、一起发布，无需再改这个文件。
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+    paths-ignore: [ '**/*.md', '.gitignore' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: '为当前版本创建/更新 GitHub Release'
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ------------------------------------------------------------------
+  # 1. 读取版本号、决定要构建哪些应用、是否发布
+  # ------------------------------------------------------------------
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      publish: ${{ steps.v.outputs.publish }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+      has_tauri: ${{ steps.v.outputs.has_tauri }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          file_version="$(tr -d ' \r\n' < VERSION)"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+            src="tag ${GITHUB_REF_NAME}"
+            if [ "$version" != "$file_version" ]; then
+              echo "::warning::标签版本 ($version) 与 VERSION 文件 ($file_version) 不一致，以标签为准"
+            fi
+          else
+            version="$file_version"
+            src="VERSION file"
+          fi
+
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]]; then
+            echo "::error::版本号 '$version'（来自 $src）不是合法的 SemVer，例如 1.2.3 或 1.2.3-beta.1"
+            exit 1
+          fi
+          tag="v${version}"
+
+          publish=false
+          case "${GITHUB_EVENT_NAME}" in
+            push)
+              if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+                publish=true
+              elif git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+                echo "标签 ${tag} 已存在 → 只构建不发布（要发布新版本请先修改 VERSION）"
+              else
+                publish=true
+              fi
+              ;;
+            workflow_dispatch)
+              publish="${{ inputs.publish }}"
+              ;;
+          esac
+
+          prerelease=false
+          if [[ "$version" == *-* ]]; then prerelease=true; fi
+
+          has_tauri=false
+          if [ -f tauri/src-tauri/tauri.conf.json ]; then has_tauri=true; fi
+
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "publish=$publish"
+            echo "prerelease=$prerelease"
+            echo "has_tauri=$has_tauri"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### 构建计划"
+            echo "- 版本号：\`$version\`（来自 $src）"
+            echo "- 发布到 Release：\`$publish\`（标签 \`$tag\`）"
+            echo "- WPF 版：构建"
+            echo "- Tauri 版：$([ "$has_tauri" = true ] && echo 构建 || echo '未检测到 tauri/ 项目，跳过')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------
+  # 2. WPF 版（wpf/）
+  # ------------------------------------------------------------------
+  build-wpf:
+    needs: prepare
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Publish single-file exe
+        shell: pwsh
+        run: |
+          dotnet publish wpf/WifiPriority.csproj -c Release -r win-x64 --self-contained true `
+            -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:Version=$env:VERSION -o out/wpf
+          if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed" }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item out/wpf/WifiPriority.exe "dist/WifiPriority-wpf-v$env:VERSION-win-x64.exe"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-wpf
+          path: dist/*
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # 3. Tauri 版（tauri/，目录存在才会运行）
+  # ------------------------------------------------------------------
+  build-tauri:
+    needs: prepare
+    if: needs.prepare.outputs.has_tauri == 'true'
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    defaults:
+      run:
+        working-directory: tauri
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tauri/src-tauri -> target
+
+      # 把统一的版本号写进 tauri.conf.json（兼容 v2 的顶层 version 与 v1 的 package.version）
+      - name: Inject version
+        shell: bash
+        run: |
+          node -e "
+            const fs = require('fs');
+            const f = 'src-tauri/tauri.conf.json';
+            const j = JSON.parse(fs.readFileSync(f, 'utf8'));
+            if (j.package) { j.package.version = process.env.VERSION; } else { j.version = process.env.VERSION; }
+            fs.writeFileSync(f, JSON.stringify(j, null, 2));
+            console.log('tauri version ->', process.env.VERSION);
+          "
+
+      - name: Install frontend dependencies
+        shell: bash
+        run: |
+          if [ -f pnpm-lock.yaml ]; then npm i -g pnpm && pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then yarn install --frozen-lockfile
+          elif [ -f package-lock.json ]; then npm ci
+          else npm install
+          fi
+
+      - name: Build
+        shell: bash
+        run: npx --no-install tauri build
+
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
+          New-Item -ItemType Directory -Force $dist | Out-Null
+          $rel = "src-tauri/target/release"
+
+          Get-ChildItem "$rel/bundle/nsis/*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object {
+            Copy-Item $_.FullName "$dist/WifiPriority-tauri-v$env:VERSION-x64-setup.exe"
+          }
+          Get-ChildItem "$rel/bundle/msi/*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object {
+            Copy-Item $_.FullName "$dist/WifiPriority-tauri-v$env:VERSION-x64.msi"
+          }
+          # 免安装 exe：文件名 = src-tauri/Cargo.toml 里 [package] 的 name
+          $m = Select-String -Path "src-tauri/Cargo.toml" -Pattern '^\s*name\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if ($m) {
+            $exe = "$rel/$($m.Matches[0].Groups[1].Value).exe"
+            if (Test-Path $exe) { Copy-Item $exe "$dist/WifiPriority-tauri-v$env:VERSION-portable.exe" }
+          }
+          if (-not (Get-ChildItem $dist -ErrorAction SilentlyContinue)) { throw "没有找到任何 Tauri 构建产物" }
+          Get-ChildItem $dist | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-tauri
+          path: dist/*
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # 4. 汇总产物 → 生成校验和 → 创建 / 更新 GitHub Release
+  # ------------------------------------------------------------------
+  release:
+    needs: [ prepare, build-wpf, build-tauri ]
+    if: ${{ !cancelled() && needs.prepare.outputs.publish == 'true' && needs.build-wpf.result == 'success' && (needs.build-tauri.result == 'success' || needs.build-tauri.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.prepare.outputs.tag }}
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          files: dist/*
