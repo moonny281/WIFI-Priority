@@ -14,7 +14,6 @@
     <Version Condition="Exists('$(MSBuildThisFileDirectory)..\VERSION')">$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)..\VERSION').Trim())</Version>
     <Product>WiFi Priority</Product>
     <Description>Auto-switch WiFi by your own priority list</Description>
-    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
 
     <!-- 单文件、自包含：用户电脑无需安装 .NET -->
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
