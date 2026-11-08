@@ -40,7 +40,7 @@ namespace WifiPriority.Services
             if (!Native.IsMicaSupported) app.Resources["WindowTint"] = app.Resources["WindowSolid"];
             else app.Resources.Remove("WindowTint");
 
-            if (App.Main != null) ApplyMica(App.Main);
+            if (App.MainWin != null) ApplyMica(App.MainWin);
         }
 
         public static void ApplyMica(Window w)
