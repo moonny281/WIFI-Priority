@@ -13,6 +13,7 @@
     <!-- 版本号唯一来源：仓库根目录的 VERSION 文件（CI 也读它） -->
     <Version Condition="Exists('$(MSBuildThisFileDirectory)..\VERSION')">$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)..\VERSION').Trim())</Version>
     <Product>WiFi Priority</Product>
+    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
     <Description>Auto-switch WiFi by your own priority list</Description>
 
     <!-- 单文件、自包含：用户电脑无需安装 .NET -->
@@ -24,5 +25,14 @@
     <DebugType>none</DebugType>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
   </PropertyGroup>
+
+
+  <ItemGroup>
+    <Resource Include="Assets\app.ico" />
+    <Resource Include="Assets\logo.png" />
+    <Resource Include="Assets\tray-connected.ico" />
+    <Resource Include="Assets\tray-idle.ico" />
+    <Resource Include="Assets\tray-paused.ico" />
+  </ItemGroup>
 
 </Project>

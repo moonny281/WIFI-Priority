@@ -157,7 +157,9 @@ namespace WifiPriority
             }
             else
             {
-                StateText.Text = $"自动切换运行中，每 {S.ScanIntervalSec} 秒扫描一次。"
+                string scanText = S.ScanIntervalSec <= 0 ? "连续扫描" : $"每 {S.ScanIntervalSec} 秒扫描一次";
+                string mode = App.Engine.NativeMode ? "原生 WLAN 事件驱动" : "netsh 兼容模式（较慢）";
+                StateText.Text = $"自动切换运行中（{mode}，{scanText}）。"
                     + (S.Priorities.Count == 0 ? " 还没有设置优先级列表，请先到“优先级”页添加网络。" : "");
             }
         }
@@ -379,7 +381,7 @@ namespace WifiPriority
             TbInterval.Text = S.ScanIntervalSec.ToString();
             TbUp.Text = S.UpThreshold.ToString();
             TbDown.Text = S.DownThreshold.ToString();
-            TbConfirm.Text = S.ConfirmCount.ToString();
+            TbConfirmMs.Text = S.ConfirmMs.ToString();
             TbCooldown.Text = S.CooldownSec.ToString();
             TbManualPause.Text = S.ManualPauseMinutes.ToString();
             SwTakeover.IsChecked = S.TakeoverUnlisted;
@@ -411,11 +413,11 @@ namespace WifiPriority
         void Settings_Changed(object sender, RoutedEventArgs e)
         {
             if (!_ready || _loading) return;
-            S.ScanIntervalSec = ParseInt(TbInterval, S.ScanIntervalSec, 3, 600);
+            S.ScanIntervalSec = ParseInt(TbInterval, S.ScanIntervalSec, 0, 600);
             S.UpThreshold = ParseInt(TbUp, S.UpThreshold, 10, 100);
             S.DownThreshold = ParseInt(TbDown, S.DownThreshold, 0, 95);
             if (S.DownThreshold > S.UpThreshold) { S.DownThreshold = S.UpThreshold; TbDown.Text = S.DownThreshold.ToString(); }
-            S.ConfirmCount = ParseInt(TbConfirm, S.ConfirmCount, 1, 10);
+            S.ConfirmMs = ParseInt(TbConfirmMs, S.ConfirmMs, 0, 10000);
             S.CooldownSec = ParseInt(TbCooldown, S.CooldownSec, 0, 3600);
             S.ManualPauseMinutes = ParseInt(TbManualPause, S.ManualPauseMinutes, 0, 1440);
             S.TakeoverUnlisted = SwTakeover.IsChecked == true;

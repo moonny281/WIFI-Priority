@@ -18,6 +18,8 @@ namespace WifiPriority.Services
         public int Signal;   // 0-100（Windows 信号质量百分比）
         public int Band;
         public int Chan;
+        public int Rssi;     // dBm（原生读取时才有）
+        public int Iface;    // 来自第几块无线网卡
     }
 
     /// <summary>一个 WiFi 名称（SSID）下所有接入点的汇总。</summary>
@@ -28,6 +30,7 @@ namespace WifiPriority.Services
         public List<BssInfo> Bss = new List<BssInfo>();
         public string Bands = "";          // 例如 "5G 82%  ·  2.4G 64%"
         public string BandTags = "";       // 例如 "5G/2.4G"
+        public string Profile;             // 已保存的配置文件名（没有则为 null）
     }
 
     public class WifiState
@@ -37,6 +40,10 @@ namespace WifiPriority.Services
         public int Signal;
         public string CurBssid;
         public int CurBand;
+        public int CurIface = -1;
+        public string CurProfile;
+        public bool Connecting;            // 正在关联/认证中（原生读取才有）
+        public bool Fast;                  // true = 来自原生 WLAN 接口，false = 来自 netsh
         public bool LocationDenied;
         public List<NearbyNetwork> Nearby = new List<NearbyNetwork>();
         public HashSet<string> Profiles = new HashSet<string>();
@@ -67,7 +74,8 @@ namespace WifiPriority.Services
         static readonly Regex SsidNum = new Regex(@"^\s*SSID\s+\d+\s*[:：]\s*(.*?)\s*$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
         static readonly Regex SsidOnly = new Regex(@"^\s*SSID\s*[:：]\s*(.*?)\s*$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
         static readonly Regex BssidNum = new Regex(@"^\s*BSSID\s+\d+\s*[:：]\s*" + Mac, RegexOptions.IgnoreCase | RegexOptions.Compiled);
-        static readonly Regex BssidOnly = new Regex(@"^\s*BSSID\s*[:：]\s*" + Mac, RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        // “BSSID”在新版 Windows 里可能叫 “AP BSSID”，所以不认标签，只认“冒号 + MAC 地址 + 行尾”
+        static readonly Regex MacLine = new Regex(@"[:：]\s*" + Mac + @"\s*$", RegexOptions.Compiled);
         // 整行以 “: 85%” 结尾才算信号（排除 “Channel Utilization: 25 (9 %)” 这类行）
         static readonly Regex PctLine = new Regex(@"[:：]\s*(\d{1,3})\s*%\s*$", RegexOptions.Compiled);
         static readonly Regex PureInt = new Regex(@"[:：]\s*(\d{1,3})\s*$", RegexOptions.Compiled);
@@ -123,12 +131,17 @@ namespace WifiPriority.Services
 
         public static async Task<WifiState> ReadStateAsync()
         {
-            var st = new WifiState();
             var tIf = RunNetshAsync("wlan show interfaces");
             var tNet = RunNetshAsync("wlan show networks mode=bssid");
             var tPro = RunNetshAsync("wlan show profiles");
             await Task.WhenAll(tIf, tNet, tPro);
-            string ifOut = tIf.Result, netOut = tNet.Result, proOut = tPro.Result;
+            return ParseState(tIf.Result, tNet.Result, tPro.Result);
+        }
+
+        /// <summary>解析三条 netsh 命令的输出（纯函数，可单独测试）。</summary>
+        public static WifiState ParseState(string ifOut, string netOut, string proOut)
+        {
+            var st = new WifiState();
 
             // 新版 Windows 11 需要开启“位置服务”才允许读取 WiFi 信息
             if (ifOut.Contains("privacy-location") || netOut.Contains("privacy-location"))
@@ -152,9 +165,8 @@ namespace WifiPriority.Services
                 }
                 if (st.CurBssid == null)
                 {
-                    var mb = BssidOnly.Match(line);
-                    if (mb.Success) st.CurBssid = NormMac(mb.Groups[1].Value);
-                    continue;                       // BSSID 行之前的行都不关心
+                    var mb = MacLine.Match(line);
+                    if (mb.Success) { st.CurBssid = NormMac(mb.Groups[1].Value); continue; }
                 }
                 if (!sigRead)
                 {

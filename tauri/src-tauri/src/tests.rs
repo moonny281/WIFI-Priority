@@ -1,0 +1,274 @@
+use crate::decide::*;
+use crate::model::*;
+use crate::parse::*;
+
+fn st(cur: Option<(&str, i32, i64)>, bss: &[(&str, i32, i64)]) -> WifiState {
+    let mut s = WifiState::new();
+    s.fast = true;
+    let mut k = 0;
+    for (ssid, band, sig) in bss {
+        let idx = match s.nearby.iter().position(|n| n.ssid == *ssid) {
+            Some(i) => i,
+            None => {
+                s.nearby.push(NearbyNetwork { ssid: ssid.to_string(), ..Default::default() });
+                s.profiles.insert(ssid.to_string());
+                s.nearby.len() - 1
+            }
+        };
+        s.nearby[idx].bss.push(BssInfo { bssid: format!("aa:bb:cc:dd:ee:{:02x}", k), band: *band, signal: *sig, ..Default::default() });
+        k += 1;
+    }
+    for n in s.nearby.iter_mut() { summarize(n); }
+    if let Some((ssid, band, sig)) = cur {
+        s.connected = true;
+        s.ssid = ssid.to_string();
+        s.cur_band = band;
+        s.signal = sig;
+        let n = s.nearby.iter_mut().find(|n| n.ssid == ssid).unwrap();
+        let b = n.bss.iter_mut().find(|b| b.band == band).unwrap();
+        b.signal = sig;
+        s.cur_bssid = Some(b.bssid.clone());
+        summarize(n);
+    }
+    s
+}
+
+fn cfg(policy: &str, prefer: &str, confirm: i64, pri: &[&str]) -> Settings {
+    let mut s = Settings::fresh();
+    s.band_policy = policy.into();
+    s.prefer_band = prefer.into();
+    s.confirm_ms = confirm;
+    s.cooldown_sec = 8;
+    s.priorities = pri.iter().map(|x| x.to_string()).collect();
+    s
+}
+
+#[test]
+fn t1_global_5g_waits_confirm_then_switches_with_bssid() {
+    let mut d = Decider::new();
+    let s = cfg("Global", "5G", 400, &["Home"]);
+    let w = st(Some(("Home", 2, 70)), &[("Home", 2, 70), ("Home", 5, 80)]);
+    assert!(d.decide(&w, &s, 1000, false).connect.is_none());
+    let r = d.decide(&w, &s, 1450, false);
+    let p = r.connect.expect("should switch");
+    assert_eq!(p.band, 5);
+    assert!(p.bssid.is_some());
+    assert_eq!(p.ssid, "Home");
+}
+
+#[test]
+fn t1c_confirm_zero_is_immediate() {
+    let mut d = Decider::new();
+    let s = cfg("Global", "5G", 0, &["Home"]);
+    let w = st(Some(("Home", 2, 70)), &[("Home", 2, 70), ("Home", 5, 80)]);
+    assert!(d.decide(&w, &s, 1000, false).connect.is_some());
+}
+
+#[test]
+fn t2_disconnected_connects_immediately_with_relaxed_threshold() {
+    let mut d = Decider::new();
+    let s = cfg("Global", "5G", 400, &["Home"]);
+    let w = st(None, &[("Home", 2, 45), ("Home", 5, 42)]);
+    let p = d.decide(&w, &s, 1000, false).connect.expect("connect");
+    assert_eq!(p.band, 5);
+    assert!(p.from_label.is_none());
+}
+
+#[test]
+fn t3_fallback_to_2g_when_5g_drops() {
+    let mut d = Decider::new();
+    let s = cfg("Global", "5G", 400, &["Home"]);
+    let w = st(Some(("Home", 5, 30)), &[("Home", 2, 55), ("Home", 5, 30)]);
+    d.decide(&w, &s, 1000, false);
+    let p = d.decide(&w, &s, 1500, false).connect.expect("fallback");
+    assert_eq!(p.band, 2);
+    assert!(p.reason.contains("回落"));
+}
+
+#[test]
+fn t4_policies() {
+    let w = st(Some(("Home", 5, 80)), &[("Home", 5, 80), ("Office", 2, 80)]);
+    let mut d1 = Decider::new();
+    assert_eq!(d1.decide(&w, &cfg("Same", "5G", 0, &["Office", "Home"]), 1000, false).connect.map(|p| p.ssid), Some("Office".to_string()));
+    let mut d2 = Decider::new();
+    assert!(d2.decide(&w, &cfg("Global", "5G", 0, &["Office", "Home"]), 1000, false).connect.is_none());
+    let mut d3 = Decider::new();
+    assert_eq!(d3.decide(&w, &cfg("Off", "5G", 0, &["Office", "Home"]), 1000, false).connect.map(|p| p.ssid), Some("Office".to_string()));
+}
+
+#[test]
+fn t5_hysteresis_keeps_5g_at_50() {
+    let mut d = Decider::new();
+    let w = st(Some(("Home", 5, 50)), &[("Home", 2, 80), ("Home", 5, 50)]);
+    assert!(d.decide(&w, &cfg("Global", "5G", 0, &["Home"]), 1000, false).connect.is_none());
+}
+
+#[test]
+fn t6_up_threshold() {
+    let mut d = Decider::new();
+    let w = st(Some(("Home", 2, 70)), &[("Home", 2, 70), ("Home", 5, 55)]);
+    assert!(d.decide(&w, &cfg("Global", "5G", 0, &["Home"]), 1000, false).connect.is_none());
+}
+
+#[test]
+fn t7_no_duplicate_requests_and_failure_marks_bad() {
+    let mut d = Decider::new();
+    let s = cfg("Global", "5G", 0, &["A", "B"]);
+    let w = st(Some(("B", 2, 70)), &[("A", 2, 80), ("B", 2, 70)]);
+    assert_eq!(d.decide(&w, &s, 1000, false).connect.map(|p| p.ssid), Some("A".to_string()));
+    assert!(d.decide(&w, &s, 1300, false).connect.is_none());
+    let r = d.decide(&w, &s, 5200, false);
+    assert!(r.connect.is_none());
+    assert!(r.logs.iter().any(|l| l.contains("没有成功")));
+    assert!(d.decide(&w, &s, 6000, false).connect.is_none());
+}
+
+#[test]
+fn t8_band_not_accepted_is_blacklisted() {
+    let mut d = Decider::new();
+    let s = cfg("Global", "5G", 0, &["Home"]);
+    let w = st(Some(("Home", 2, 70)), &[("Home", 2, 70), ("Home", 5, 80)]);
+    assert_eq!(d.decide(&w, &s, 1000, false).connect.map(|p| p.band), Some(5));
+    assert!(d.decide(&w, &s, 2000, false).connect.is_none());
+    let r = d.decide(&w, &s, 5500, false);
+    assert!(r.logs.iter().any(|l| l.contains("未能切换到")));
+    assert!(d.decide(&w, &s, 9000, false).connect.is_none());
+}
+
+#[test]
+fn t9_manual_change_pauses() {
+    let mut d = Decider::new();
+    let s = cfg("Global", "5G", 0, &["Home"]);
+    d.decide(&st(Some(("Home", 5, 80)), &[("Home", 5, 80), ("Other", 5, 90)]), &s, 1000, false);
+    let r = d.decide(&st(Some(("Other", 5, 90)), &[("Home", 5, 80), ("Other", 5, 90)]), &s, 2000, false);
+    assert_eq!(r.pause_minutes, s.manual_pause_minutes);
+    assert!(r.connect.is_none());
+}
+
+#[test]
+fn t10_takeover_unlisted() {
+    let mut d = Decider::new();
+    let mut s = cfg("Global", "5G", 0, &["Home"]);
+    s.takeover_unlisted = false;
+    let w = st(Some(("Phone", 5, 90)), &[("Phone", 5, 90), ("Home", 5, 80)]);
+    assert!(d.decide(&w, &s, 1000, false).connect.is_none());
+    s.takeover_unlisted = true;
+    assert_eq!(d.decide(&w, &s, 1000, false).connect.map(|p| p.ssid), Some("Home".to_string()));
+}
+
+#[test]
+fn t11_prefer_24g() {
+    let mut d = Decider::new();
+    let w = st(Some(("Home", 5, 80)), &[("Home", 2, 80), ("Home", 5, 80)]);
+    assert_eq!(d.decide(&w, &cfg("Global", "2.4G", 0, &["Home"]), 1000, false).connect.map(|p| p.band), Some(2));
+}
+
+#[test]
+fn t12_unsaved_network_ignored() {
+    let mut d = Decider::new();
+    let mut w = st(Some(("B", 2, 70)), &[("A", 5, 90), ("B", 2, 70)]);
+    w.profiles.remove("A");
+    assert!(d.decide(&w, &cfg("Global", "5G", 0, &["A", "B"]), 1000, false).connect.is_none());
+}
+
+// ---------------- netsh 解析 ----------------
+const IF_EN: &str = "There is 1 interface on the system:\r\n\r\n    Name                   : Wi-Fi\r\n    Description            : Intel(R) Wi-Fi 6 AX201 160MHz\r\n    GUID                   : 11111111-2222-3333-4444-555555555555\r\n    Physical address       : 00:11:22:33:44:55\r\n    State                  : connected\r\n    SSID                   : Home\r\n    BSSID                  : aa:bb:cc:dd:ee:12\r\n    Network type           : Infrastructure\r\n    Radio type             : 802.11ax\r\n    Authentication         : WPA2-Personal\r\n    Cipher                 : CCMP\r\n    Connection mode        : Auto Connect\r\n    Band                   : 5 GHz\r\n    Channel                : 36\r\n    Receive rate (Mbps)    : 866.7\r\n    Transmit rate (Mbps)   : 866.7\r\n    Signal                 : 91%\r\n    Profile                : Home\r\n";
+const NET_EN: &str = "Interface name : Wi-Fi \r\nThere are 3 networks currently visible. \r\n\r\nSSID 1 : Home \r\n    Network type            : Infrastructure\r\n    Authentication          : WPA2-Personal\r\n    Encryption              : CCMP \r\n    BSSID 1                 : aa:bb:cc:dd:ee:12\r\n         Signal             : 91%  \r\n         Radio type         : 802.11ax\r\n         Band               : 5 GHz  \r\n         Channel            : 36 \r\n         Basic rates (Mbps) : 6 12 24\r\n         Other rates (Mbps) : 9 18 36 48 54\r\n         BSS Load:\r\n             Connected Stations:         3\r\n             Channel Utilization:        25 (9 %)\r\n    BSSID 2                 : aa:bb:cc:dd:ee:13\r\n         Signal             : 60%  \r\n         Radio type         : 802.11n\r\n         Band               : 2.4 GHz  \r\n         Channel            : 6 \r\n\r\nSSID 2 : Cafe_Guest \r\n    Network type            : Infrastructure\r\n    BSSID 1                 : 12:34:56:78:9a:bc\r\n         Signal             : 40%  \r\n         Radio type         : 802.11n\r\n         Channel            : 1 \r\n\r\nSSID 3 : \r\n    Network type            : Infrastructure\r\n    BSSID 1                 : 12:34:56:78:9a:bd\r\n         Signal             : 99%  \r\n         Channel            : 44 \r\n";
+const PRO_EN: &str = "Profiles on interface Wi-Fi:\r\n\r\nGroup policy profiles (read only)\r\n---------------------------------\r\n    <None>\r\n\r\nUser profiles\r\n-------------\r\n    All User Profile     : Home\r\n    All User Profile     : Cafe_Guest\r\n";
+const IF_CN: &str = "系统上有 1 个接口:\r\n\r\n    名称                   : WLAN\r\n    描述                   : Realtek 8822CE\r\n    GUID                   : 11111111-2222-3333-4444-555555555555\r\n    物理地址               : 00:11:22:33:44:55\r\n    状态                   : 已连接\r\n    SSID                   : 家里WiFi\r\n    AP BSSID               : aa:bb:cc:dd:ee:34\r\n    网络类型               : 结构\r\n    无线电类型             : 802.11ac\r\n    身份验证               : WPA2-个人\r\n    密码                   : CCMP\r\n    连接模式               : 自动连接\r\n    频带                   : 2.4 GHz\r\n    信道                   : 11\r\n    接收速率(Mbps)         : 144.4\r\n    传输速率(Mbps)         : 144.4\r\n    信号                   : 77%\r\n    配置文件               : 家里WiFi\r\n";
+
+#[test]
+fn p1_english_interface() {
+    let p = parse_state(IF_EN, NET_EN, PRO_EN);
+    assert!(p.connected && p.ssid == "Home" && p.signal == 91 && p.cur_band == 5);
+    assert_eq!(p.cur_bssid.as_deref(), Some("aa:bb:cc:dd:ee:12"));
+}
+
+#[test]
+fn p2_ap_bssid_label_win11_24h2() {
+    let w = IF_EN.replace("BSSID                  :", "AP BSSID               :");
+    let p = parse_state(&w, NET_EN, PRO_EN);
+    assert!(p.connected && p.signal == 91 && p.cur_band == 5);
+    assert_eq!(p.cur_bssid.as_deref(), Some("aa:bb:cc:dd:ee:12"));
+}
+
+#[test]
+fn p3_band_inferred_from_channel() {
+    let w = IF_EN.replace("    Band                   : 5 GHz\r\n", "").replace("Channel                : 36", "Channel                : 6");
+    let p = parse_state(&w, "", PRO_EN);
+    assert!(p.signal == 91 && p.cur_band == 2);
+}
+
+#[test]
+fn p4_chinese_interface() {
+    let p = parse_state(IF_CN, NET_EN, PRO_EN);
+    assert!(p.ssid == "家里WiFi" && p.signal == 77 && p.cur_band == 2);
+    assert_eq!(p.cur_bssid.as_deref(), Some("aa:bb:cc:dd:ee:34"));
+}
+
+#[test]
+fn p5_per_band_signals_ignore_utilization() {
+    let p = parse_state(IF_EN, NET_EN, PRO_EN);
+    let home = p.nearby.iter().find(|n| n.ssid == "Home").unwrap();
+    assert_eq!(home.bss.len(), 2);
+    assert_eq!(home.signal, 91);
+    assert_eq!(home.bands, "5G 91%  ·  2.4G 60%");
+    assert_eq!(home.band_tags, "5G/2.4G");
+}
+
+#[test]
+fn p6_hidden_ssid_skipped_band_from_channel() {
+    let p = parse_state(IF_EN, NET_EN, PRO_EN);
+    assert_eq!(p.nearby.len(), 2);
+    assert_eq!(p.nearby.iter().find(|n| n.ssid == "Cafe_Guest").unwrap().bss[0].band, 2);
+}
+
+#[test]
+fn p7_profiles() {
+    let p = parse_state(IF_EN, NET_EN, PRO_EN);
+    assert!(p.profiles.contains("Home") && p.profiles.contains("Cafe_Guest") && p.profiles.len() == 2);
+}
+
+#[test]
+fn p8_location_denied() {
+    let p = parse_state("Network shell commands need location permission to access WLAN information. ms-settings:privacy-location", "", "");
+    assert!(p.location_denied && !p.connected);
+}
+
+// ---------------- 设置 ----------------
+#[test]
+fn s1_old_settings_migrate_and_keep_user_choices() {
+    let json = r#"{"ScanIntervalSec":10,"ConfirmCount":2,"CooldownSec":60,"Priorities":["Home"],"Theme":"Dark","UpThreshold":65}"#;
+    let s = Settings::from_json(json).unwrap();
+    assert_eq!((s.scan_interval_sec, s.confirm_ms, s.cooldown_sec), (3, 400, 8));
+    assert_eq!(s.theme, "Dark");
+    assert_eq!(s.up_threshold, 65);
+    assert_eq!(s.priorities, vec!["Home".to_string()]);
+    assert_eq!(s.schema_version, CURRENT_SCHEMA);
+}
+
+#[test]
+fn s2_current_schema_is_not_overwritten() {
+    let json = r#"{"SchemaVersion":2,"ScanIntervalSec":7,"ConfirmMs":900,"CooldownSec":20}"#;
+    let s = Settings::from_json(json).unwrap();
+    assert_eq!((s.scan_interval_sec, s.confirm_ms, s.cooldown_sec), (7, 900, 20));
+}
+
+#[test]
+fn s3_roundtrip_uses_pascal_case_like_wpf() {
+    let s = Settings::fresh();
+    let j = serde_json::to_string(&s).unwrap();
+    for k in ["\"ScanIntervalSec\"", "\"ConfirmMs\"", "\"BandPolicy\"", "\"OverlayX\"", "\"SchemaVersion\"", "\"TakeoverUnlisted\""] {
+        assert!(j.contains(k), "missing {}", k);
+    }
+}
+
+#[test]
+fn s4_sanitize() {
+    let mut s = Settings::fresh();
+    s.up_threshold = 50; s.down_threshold = 80; s.band_policy = "x".into(); s.overlay_opacity = 5.0; s.scan_interval_sec = -3;
+    s.sanitize();
+    assert_eq!((s.up_threshold, s.down_threshold, s.scan_interval_sec), (50, 50, 0));
+    assert_eq!(s.band_policy, "Global");
+    assert_eq!(s.overlay_opacity, 1.0);
+}

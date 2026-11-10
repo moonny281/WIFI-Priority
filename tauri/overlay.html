@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WiFi 悬浮框</title>
+  </head>
+  <body class="overlay">
+    <div id="root">
+      <div id="pill" class="pill" data-tauri-drag-region>
+        <span id="bars" class="bars lv0"><i></i><i></i><i></i><i></i></span>
+        <div class="text">
+          <div id="ssid" class="ssid">WiFi 检测中…</div>
+          <div id="sub" class="sub"></div>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/overlay.ts"></script>
+  </body>
+</html>

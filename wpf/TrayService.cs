@@ -1,18 +1,13 @@
 using System;
 using System.Drawing;
-using System.Drawing.Drawing2D;
-using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using WifiPriority.Services;
 
 namespace WifiPriority
 {
-    /// <summary>系统托盘图标与右键菜单（图标运行时绘制，无需额外资源文件）。</summary>
+    /// <summary>系统托盘图标（已连接 / 未连接 / 已暂停三种状态）与右键菜单。</summary>
     public class TrayService : IDisposable
     {
-        [DllImport("user32.dll")]
-        static extern bool DestroyIcon(IntPtr handle);
-
         readonly NotifyIcon _ni;
         readonly ToolStripMenuItem _pause, _overlay, _lock;
         Icon _icon;
@@ -51,7 +46,7 @@ namespace WifiPriority
                 _lock.Checked = App.Settings.OverlayLocked;
             };
 
-            _icon = MakeIcon(Color.FromArgb(140, 146, 160));
+            _icon = LoadIcon("tray-idle.ico");
             _ni = new NotifyIcon
             {
                 Visible = true,
@@ -71,11 +66,8 @@ namespace WifiPriority
             if (state != _state)
             {
                 _state = state;
-                Color c = state == 2 ? Color.FromArgb(247, 144, 9)
-                        : state == 1 ? Color.FromArgb(30, 136, 255)
-                        : Color.FromArgb(140, 146, 160);
                 var old = _icon;
-                _icon = MakeIcon(c);
+                _icon = LoadIcon(state == 2 ? "tray-paused.ico" : state == 1 ? "tray-connected.ico" : "tray-idle.ico");
                 _ni.Icon = _icon;
                 old?.Dispose();
             }
@@ -89,30 +81,14 @@ namespace WifiPriority
             try { _ni.ShowBalloonTip(4000, title, text, ToolTipIcon.Info); } catch { }
         }
 
-        static Icon MakeIcon(Color c)
+        static Icon LoadIcon(string name)
         {
-            using (var bmp = new Bitmap(32, 32))
+            try
             {
-                using (var g = Graphics.FromImage(bmp))
-                {
-                    g.SmoothingMode = SmoothingMode.AntiAlias;
-                    g.Clear(Color.Transparent);
-                    using (var pen = new Pen(c, 3.2f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
-                    {
-                        for (int i = 1; i <= 3; i++)
-                        {
-                            float r = i * 7f;
-                            g.DrawArc(pen, 16 - r, 26 - r, 2 * r, 2 * r, 225, 90);
-                        }
-                    }
-                    using (var br = new SolidBrush(c))
-                        g.FillEllipse(br, 13.5f, 23.5f, 5f, 5f);
-                }
-                IntPtr h = bmp.GetHicon();
-                var icon = (Icon)Icon.FromHandle(h).Clone();
-                DestroyIcon(h);
-                return icon;
+                var info = System.Windows.Application.GetResourceStream(new Uri("pack://application:,,,/Assets/" + name));
+                using (var stream = info.Stream) return new Icon(stream, new Size(32, 32));
             }
+            catch { return SystemIcons.Application; }
         }
 
         public void Dispose()

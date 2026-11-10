@@ -1,0 +1,209 @@
+//! 数据模型。Settings 的 JSON 字段名与 WPF 版（System.Text.Json，PascalCase）完全一致，
+//! 所以两个版本可以共用 %AppData%\WifiPriority\settings.json，随时来回切换。
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+
+pub const CURRENT_SCHEMA: i64 = 2;
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct Settings {
+    pub priorities: Vec<String>,
+
+    // 切换策略
+    pub scan_interval_sec: i64,
+    pub up_threshold: i64,
+    pub down_threshold: i64,
+    pub confirm_ms: i64,
+    pub cooldown_sec: i64,
+    pub manual_pause_minutes: i64,
+    pub takeover_unlisted: bool,
+    pub internet_check: bool,
+    pub notify: bool,
+
+    // 频段偏好：Off / Same / Global；5G / 2.4G
+    pub band_policy: String,
+    pub prefer_band: String,
+
+    // 外观与配置版本
+    pub theme: String,
+    pub schema_version: i64,
+
+    // 桌面悬浮框
+    pub overlay_enabled: bool,
+    pub overlay_locked: bool,
+    pub overlay_show_signal: bool,
+    pub overlay_opacity: f64,
+    pub overlay_scale: f64,
+    pub overlay_anchor: String,
+    pub overlay_x: f64,
+    pub overlay_y: f64,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            priorities: Vec::new(),
+            scan_interval_sec: 3,
+            up_threshold: 60,
+            down_threshold: 40,
+            confirm_ms: 400,
+            cooldown_sec: 8,
+            manual_pause_minutes: 10,
+            takeover_unlisted: true,
+            internet_check: false,
+            notify: true,
+            band_policy: "Global".into(),
+            prefer_band: "5G".into(),
+            theme: "System".into(),
+            schema_version: 0, // 0 = 配置文件里没有这个字段（旧版本写的）
+            overlay_enabled: true,
+            overlay_locked: false,
+            overlay_show_signal: true,
+            overlay_opacity: 0.95,
+            overlay_scale: 1.0,
+            overlay_anchor: "TopRight".into(),
+            overlay_x: 0.0,
+            overlay_y: 0.0,
+        }
+    }
+}
+
+impl Settings {
+    /// 全新安装用的默认值（已经是最新配置版本）。
+    pub fn fresh() -> Settings {
+        Settings { schema_version: CURRENT_SCHEMA, ..Settings::default() }
+    }
+
+    /// 解析配置文件内容；旧版本（v1.1.0 及以前）的配置会迁移成快速默认值。
+    pub fn from_json(text: &str) -> Option<Settings> {
+        let mut s: Settings = serde_json::from_str(text).ok()?;
+        if s.schema_version < CURRENT_SCHEMA {
+            s.scan_interval_sec = 3;
+            s.confirm_ms = 400;
+            s.cooldown_sec = 8;
+            s.schema_version = CURRENT_SCHEMA;
+        }
+        s.sanitize();
+        Some(s)
+    }
+
+    /// 把各项限制在合法范围内。
+    pub fn sanitize(&mut self) {
+        self.scan_interval_sec = self.scan_interval_sec.clamp(0, 600);
+        self.up_threshold = self.up_threshold.clamp(10, 100);
+        self.down_threshold = self.down_threshold.clamp(0, 95);
+        if self.down_threshold > self.up_threshold {
+            self.down_threshold = self.up_threshold;
+        }
+        self.confirm_ms = self.confirm_ms.clamp(0, 10_000);
+        self.cooldown_sec = self.cooldown_sec.clamp(0, 3600);
+        self.manual_pause_minutes = self.manual_pause_minutes.clamp(0, 1440);
+        self.overlay_opacity = self.overlay_opacity.clamp(0.2, 1.0);
+        self.overlay_scale = self.overlay_scale.clamp(0.7, 2.0);
+        if !matches!(self.band_policy.as_str(), "Off" | "Same" | "Global") {
+            self.band_policy = "Global".into();
+        }
+        if !matches!(self.prefer_band.as_str(), "5G" | "2.4G") {
+            self.prefer_band = "5G".into();
+        }
+        if !matches!(self.theme.as_str(), "System" | "Light" | "Dark") {
+            self.theme = "System".into();
+        }
+        if !matches!(
+            self.overlay_anchor.as_str(),
+            "TopLeft" | "TopRight" | "BottomLeft" | "BottomRight" | "Free"
+        ) {
+            self.overlay_anchor = "TopRight".into();
+        }
+        self.priorities.retain(|s| !s.trim().is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WiFi 状态（前端用 camelCase）
+// ---------------------------------------------------------------------------
+
+/// 一个接入点（BSSID）。band：2 = 2.4GHz，5 = 5GHz，6 = 6GHz，0 = 未知。
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BssInfo {
+    pub bssid: String,
+    pub signal: i64, // 0-100
+    pub band: i32,
+    pub chan: i32,
+    pub rssi: i32,
+    pub iface: i32,
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NearbyNetwork {
+    pub ssid: String,
+    pub signal: i64,
+    pub bss: Vec<BssInfo>,
+    pub bands: String,     // "5G 82%  ·  2.4G 64%"
+    pub band_tags: String, // "5G/2.4G"
+    pub profile: Option<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct WifiState {
+    pub connected: bool,
+    pub connecting: bool,
+    pub fast: bool, // true = 原生 WLAN 接口；false = netsh
+    pub ssid: String,
+    pub signal: i64,
+    pub cur_bssid: Option<String>,
+    pub cur_band: i32,
+    pub cur_iface: i32,
+    pub cur_profile: Option<String>,
+    pub location_denied: bool,
+    pub nearby: Vec<NearbyNetwork>,
+    pub profiles: HashSet<String>,
+}
+
+impl WifiState {
+    pub fn new() -> WifiState {
+        WifiState {
+            connected: false,
+            connecting: false,
+            fast: false,
+            ssid: String::new(),
+            signal: 0,
+            cur_bssid: None,
+            cur_band: 0,
+            cur_iface: -1,
+            cur_profile: None,
+            location_denied: false,
+            nearby: Vec::new(),
+            profiles: HashSet::new(),
+        }
+    }
+}
+
+impl Default for WifiState {
+    fn default() -> Self {
+        WifiState::new()
+    }
+}
+
+/// 发给前端的状态快照。
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineStatus {
+    pub connected: bool,
+    pub ssid: Option<String>,
+    pub signal: i64,
+    pub cur_band: i32,
+    pub cur_bssid: Option<String>,
+    pub location_denied: bool,
+    pub paused: bool,
+    pub paused_until: Option<i64>, // unix 秒；None + paused = 手动无限期暂停
+    pub message: Option<String>,
+    pub native: bool,
+    pub nearby: Vec<NearbyNetwork>,
+    pub profiles: Vec<String>,
+}

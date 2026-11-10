@@ -1,0 +1,35 @@
+:root[data-theme='light'] {
+  --text: #1b1f27; --text2: #667085; --track: rgba(0,0,0,.15);
+  --good: #12b76a; --warn: #f79009; --bad: #f04438;
+  --ov-bg: rgba(255,255,255,.96); --ov-border: rgba(0,0,0,.12);
+}
+:root[data-theme='dark'] {
+  --text: #e6e9f0; --text2: #8a93a6; --track: rgba(255,255,255,.2);
+  --good: #3ddc97; --warn: #ffc857; --bad: #ff6b6b;
+  --ov-bg: rgba(22,26,35,.95); --ov-border: rgba(255,255,255,.2);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: transparent !important; overflow: hidden; }
+body {
+  font-family: 'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei UI', sans-serif;
+  color: var(--text); user-select: none; cursor: move;
+}
+/* 整体尺寸用 em，前端通过 root 的 font-size 实现“大小”缩放 */
+#root { display: inline-block; padding: 10px; font-size: 14px; }
+.pill {
+  display: flex; align-items: center; gap: 0.85em; padding: 0.7em 1em; border-radius: 0.85em;
+  background: var(--ov-bg); border: 1px solid var(--ov-border);
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.28);
+}
+.pill * { pointer-events: none; }   /* 让整块区域都能拖动 */
+.text { min-width: 0; }
+.ssid { font-size: 1em; font-weight: 600; max-width: 17em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sub { font-size: 0.82em; color: var(--text2); margin-top: 1px; white-space: nowrap; }
+.bars { display: inline-flex; align-items: flex-end; gap: 0.14em; height: 1.15em; flex: none; }
+.bars i { display: block; width: 0.28em; border-radius: 1px; background: var(--track); }
+.bars i:nth-child(1) { height: 0.36em; } .bars i:nth-child(2) { height: 0.62em; }
+.bars i:nth-child(3) { height: 0.88em; } .bars i:nth-child(4) { height: 1.15em; }
+.bars.lv1 i:nth-child(-n + 1) { background: var(--bad); }
+.bars.lv2 i:nth-child(-n + 2) { background: var(--warn); }
+.bars.lv3 i:nth-child(-n + 3) { background: var(--good); }
+.bars.lv4 i { background: var(--good); }

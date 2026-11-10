@@ -1,68 +1,48 @@
+<p align="center"><img src="assets/icon-512.png" width="128" alt="WiFi 优先级"></p>
+
 # WiFi 优先级（WifiPriority）
 
-Windows 小工具：按你排好的优先级自动切换 WiFi，并且**同一个 WiFi 有 5G / 2.4G 时优先 5G**。
+Windows 小工具：按你排好的优先级自动切换 WiFi，**同一个 WiFi 有 5G / 2.4G 时优先 5G**，并且**事件驱动、毫秒级响应**。
 
 - 周围出现**更高优先级**的 WiFi（信号够强）→ 自动切过去
-- 当前 WiFi **信号消失/过弱** → 自动回落到次优先级（或同一网络的另一个频段）
+- 当前 WiFi **信号消失/过弱/断线** → 立刻回落到次优先级（或同一网络的另一个频段）
 - **5G 优先于 2.4G**（可改成 2.4G 优先，或不区分频段）
 - 桌面**悬浮框**显示当前 WiFi 与频段（可拖动、吸附四角、调透明度/大小、锁定穿透、随时开关）
 - 托盘常驻、开机自启（任务计划 + 最高权限，登录后无需再点 UAC）
 - 界面：云母白（Windows 11 Mica）/ 墨夜（深色）/ 跟随系统
 
-## 仓库结构（多应用）
+## 两个版本
 
-```
-VERSION                    ← 版本号唯一来源（如 1.1.0），流水线和 WPF 项目都读它
-wpf/                       ← 当前的 WPF 版（C# / .NET 8）
-tauri/                     ← 以后放 Tauri 重构版（目录里有 src-tauri/tauri.conf.json 就会被流水线自动识别）
-.github/workflows/release.yml
-```
+| | WPF 版（`wpf/`） | Tauri v2 版（`tauri/`） |
+|---|---|---|
+| 技术 | C# / .NET 8，自包含单文件 exe | Rust + TypeScript，WebView2 界面 |
+| 体积 | 约 60 MB（自带 .NET 运行时） | 约 10 MB，另有 NSIS 安装包 |
+| 功能 | 完全一致 | 完全一致（含毫秒级切换、5G 优先、悬浮框、自启） |
+| 配置 | `%AppData%\WifiPriority\settings.json` | 同一个文件，两个版本可以随时来回切换 |
 
-## 发布流程（全自动）
+> 两个版本**不要同时运行**（会同时去切换 WiFi）。开机自启各自用独立的任务名（`WifiPriority` / `WifiPriorityTauri`），只开其中一个即可。
 
-1. 改 `VERSION`（例如 `1.1.0` → `1.2.0`），提交并推送到 `main`。
-2. 流水线自动：读版本号 → 构建 WPF 版（和已存在的 Tauri 版）→ 生成 `SHA256SUMS.txt` → 创建 GitHub Release `v1.2.0` 并上传所有产物，发布说明自动生成。
-3. 不改版本号直接推送：只构建，不发布（产物在该次运行的 Artifacts 里下载）。`v1.2.0` 已经存在时同理。
-4. 其它触发方式：推送 `v*` 标签（以标签版本号为准）；Actions 页手动运行（可选择是否发布）；Pull Request 只构建。
-5. 版本号带 `-` 的（如 `1.2.0-beta.1`）会自动标记为预发布。
+## 为什么是毫秒级
 
-发布产物命名：
+旧版本每轮要启动 3 个 `netsh` 进程（几百毫秒）、再等 2.5 秒扫描、每 10 秒才轮询一次、还要连续确认 2 次。现在：
 
-| 文件 | 说明 |
-|---|---|
-| `WifiPriority-wpf-v<版本>-win-x64.exe` | WPF 版，单文件、自包含，无需安装 .NET |
-| `WifiPriority-tauri-v<版本>-x64-setup.exe` / `.msi` / `-portable.exe` | Tauri 版（加了 `tauri/` 之后才会出现） |
-| `SHA256SUMS.txt` | 所有文件的校验和 |
+1. **原生 WLAN API**：直接调用 `wlanapi.dll`，读取当前连接 / 附近网络 / BSSID 只需进程内调用（通常不到 5 ms），不再启动任何子进程。
+2. **事件驱动**：订阅 WLAN 通知（断线、连上、扫描完成），事件一来立刻评估；平时每 250 ms 用缓存数据评估一次。
+3. **直接发连接请求**：`WlanConnect` 在进程内发出（可指定 BSSID 来选 5G/2.4G），不再 fork `netsh`。
+4. **更短的防抖**：确认时间默认 400 ms（可设 0 = 立即），升级冷却 8 秒；**断线/未连接时不等确认，立刻连**；信号丢失的回落不受冷却限制。
+5. **不阻塞**：联网检测放到后台线程；连接结果在后续评估里顺带检查，不再傻等。
 
-未做代码签名，首次运行 SmartScreen 可能提示“未知发布者”，点“更多信息 → 仍要运行”即可。
+日志页会记录每次切换从“读取状态”到“连接请求发出”的实际耗时。
 
-### 以后加入 Tauri 版
+**哪些仍然不是毫秒**（Windows / 硬件决定，程序无法加速）：
 
-把 Tauri 项目放进 `tauri/`（即 `tauri/package.json` 和 `tauri/src-tauri/tauri.conf.json`），不用改流水线。流水线会：
-
-- 自动用统一的版本号覆盖 `tauri.conf.json` 的 version
-- 按锁文件识别 npm / pnpm / yarn 并安装依赖，然后执行 `npx tauri build`（需要 `@tauri-apps/cli` 在 devDependencies 里）
-- 收集 NSIS 安装包、MSI 和免安装 exe，与 WPF 版一起发布
-
-### 本地编译 WPF 版
-
-安装 .NET 8 SDK 后：
-
-```
-dotnet publish wpf/WifiPriority.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o out
-```
-
-## 使用
-
-1. 首次运行：到 **优先级** 页添加网络。已经在 Windows 里连过的网络直接填名称（或在 **附近网络** 页一键加入）；没连过的填名称 + 密码（仅支持 WPA2 个人版，WPA3/企业网络请先在 Windows 里手动连一次）。
-2. 拖动条目（或点 ▲▼）排序，越靠上优先级越高。
-3. **设置 → 频段偏好** 选择 5G/2.4G 的策略（见下）。
-4. **设置 → 开机自启**：开启时会弹一次管理员授权（UAC），之后每次登录自动在后台运行。
-5. 关闭主窗口只会最小化到托盘；托盘右键可暂停/恢复、显示/隐藏悬浮框、退出。
+- 连接请求发出后，网卡与路由器的关联、认证握手通常需要几百毫秒到 1–2 秒。
+- 发现一个**新出现**的更高优先级网络，取决于扫描完成的速度（一次完整扫描通常 1–3 秒）；程序默认每 3 秒请求一次扫描，可设为 0 = 连续扫描（最快，略费电）。Windows 可能对频繁扫描限流。
+- 若原生接口不可用或校验失败，会自动回退到旧的 netsh 模式（较慢，日志会提示）。
 
 ## 5G 优先怎么工作
 
-程序会读取每个接入点（BSSID）的频段和信号，把“列表 × 频段”展开成候选项再排序。**频段策略**有三档：
+程序读取每个接入点（BSSID）的频段和信号，把“列表 × 频段”展开成候选项再排序。**频段策略**有三档：
 
 | 策略 | 规则 |
 |---|---|
@@ -73,39 +53,89 @@ dotnet publish wpf/WifiPriority.csproj -c Release -r win-x64 --self-contained tr
 > 默认是“全局”：它会让列表里靠后的 5G 网络排到靠前的 2.4G 网络前面。如果你希望列表顺序绝对优先，请改成“仅同一网络内”。
 
 - 6G（Wi‑Fi 6E）排在 5G 之前；优先频段可改为“2.4G 优先”。
-- 防抖：切到 5G 要求信号 ≥ 升级阈值（默认 60%）；5G 低于回落阈值（默认 40%）才退回 2.4G，中间 40–60% 不动，避免来回跳。
-- 同一个 WiFi 内换频段是通过“指定接入点（BSSID）重新连接”实现的。如果路由器或网卡驱动不接受，程序会在日志里提示，并在 10 分钟内不再尝试该频段，不会反复断线重连。
+- 防抖：切到 5G 要求信号 ≥ 升级阈值（默认 60%）；5G 低于回落阈值（默认 40%）才退回 2.4G，中间 40–60% 不动。
+- 同一个 WiFi 内换频段是“指定接入点（BSSID）重新连接”。如果路由器或网卡驱动不接受，程序会在日志里提示，并在 10 分钟内不再尝试该频段，不会反复断线重连。
 
 ## 切换策略（均可在设置里调整）
 
 | 项 | 默认 | 说明 |
 |---|---|---|
-| 扫描间隔 | 10 秒 | 另外在系统唤醒、网络变化时会立即扫描 |
+| 主动扫描间隔 | 3 秒 | 0 = 连续扫描；另外在断线、连上、系统唤醒、网络变化时会立即评估 |
 | 升级阈值 | ≥ 60%（≈ −70 dBm） | 更优候选信号达到才会切过去 |
 | 回落阈值 | < 40%（≈ −80 dBm） | 当前网络低于此值或消失，视为丢失；此时回落目标只要求 ≥ 此值 |
-| 连续确认 | 2 次 | 防止偶尔一次扫描抖动造成误切 |
-| 冷却时间 | 60 秒 | 升级切换之间的最短间隔，防止来回跳 |
+| 确认时间 | 400 毫秒 | 候选必须持续最优这么久才切换；0 = 立即 |
+| 升级冷却 | 8 秒 | 两次“升级”切换的最短间隔，防止来回跳（回落不受限制） |
 | 手动换网后暂停 | 10 分钟 | 你在 Windows 里手动换网时，不和你对着干 |
+
+从 v1.1.0 升级时，旧的“10 秒 / 2 次 / 60 秒”默认值会自动迁移成上面的新默认值（其它设置保持不变）。
+
+## 仓库结构
+
+```
+VERSION                    ← 版本号唯一来源（如 1.1.1），流水线、WPF、Tauri 都读它
+assets/                    ← 图标预览（icon-512.png / icon-1024.png）
+wpf/                       ← WPF 版（C# / .NET 8）
+tauri/                     ← Tauri v2 版（Rust 后端 + TypeScript 前端）
+.github/workflows/release.yml
+```
+
+## 发布流程（全自动）
+
+1. 改 `VERSION`（例如 `1.1.1` → `1.2.0`），提交并推送到 `main`。
+2. 流水线自动：读版本号 → 构建 WPF 版和 Tauri 版 → 生成 `SHA256SUMS.txt` → 创建 GitHub Release `v1.2.0` 并上传所有产物，发布说明自动生成。
+3. 不改版本号直接推送：只构建，不发布（产物在该次运行的 Artifacts 里下载）。`v1.2.0` 已经存在时同理。
+4. 其它触发方式：推送 `v*` 标签（以标签版本号为准）；Actions 页手动运行（可选择是否发布）；Pull Request 只构建。
+5. 版本号带 `-` 的（如 `1.2.0-beta.1`）会自动标记为预发布。
+
+发布产物：
+
+| 文件 | 说明 |
+|---|---|
+| `WifiPriority-wpf-v<版本>-win-x64.exe` | WPF 版，单文件、自包含，无需安装 .NET |
+| `WifiPriority-tauri-v<版本>-x64-setup.exe` | Tauri 版安装包（NSIS，当前用户安装，无需管理员） |
+| `WifiPriority-tauri-v<版本>-portable.exe` | Tauri 版免安装 exe（需要系统有 WebView2，Win10/11 默认自带） |
+| `SHA256SUMS.txt` | 所有文件的校验和 |
+
+未做代码签名，首次运行 SmartScreen 可能提示“未知发布者”，点“更多信息 → 仍要运行”即可。
+
+### 本地编译
+
+```
+# WPF（需要 .NET 8 SDK）
+dotnet publish wpf/WifiPriority.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o out
+
+# Tauri（需要 Node 20+ 和 Rust stable）
+cd tauri && npm install && npx tauri build
+```
+
+## 使用
+
+1. 首次运行：到 **优先级** 页添加网络。已经在 Windows 里连过的网络直接填名称（或在 **附近网络** 页一键加入）；没连过的填名称 + 密码（仅支持 WPA2 个人版，WPA3/企业网络请先在 Windows 里手动连一次）。
+2. 拖动条目（或点 ▲▼）排序，越靠上优先级越高。
+3. **设置 → 频段偏好** 选择 5G/2.4G 的策略。
+4. **设置 → 开机自启**：开启时会弹一次管理员授权（UAC），之后每次登录自动在后台运行。
+5. 关闭主窗口只会最小化到托盘；托盘右键可暂停/恢复、显示/隐藏悬浮框、吸附位置、退出。
 
 ## 注意事项
 
 - **位置服务**：新版 Windows 11 要求开启“设置 → 隐私和安全性 → 位置”，程序才能读取周围 WiFi。没开时概览页会提示并提供一键跳转按钮。
-- 程序只能连接**已保存配置文件**的网络，且默认假设配置文件名 = WiFi 名称（Windows 默认如此）。
+- 程序只能连接**已保存配置文件**的网络。原生模式下会自动使用 Windows 里该网络对应的配置文件名（不再要求与 WiFi 名称相同）。
 - 权限：程序平时以普通权限运行；开机自启由任务计划以“最高权限”启动，因此不用每次 UAC。如果移动了 exe 位置，请在设置里关闭再重新开启开机自启。
 - 配置保存在 `%AppData%\WifiPriority\settings.json`。
 
-## WPF 项目结构
+## 项目结构
 
 ```
-wpf/WifiPriority.csproj      项目文件（net8.0-windows，WPF + WinForms 托盘，单文件发布；版本读自 ../VERSION）
-wpf/App.xaml(.cs)            入口：单实例、托盘、系统事件、引擎启动
-wpf/MainWindow.xaml(.cs)     主窗口：概览 / 优先级 / 附近网络 / 悬浮框 / 设置 / 日志
-wpf/OverlayWindow.xaml(.cs)  桌面悬浮框
-wpf/TrayService.cs           托盘图标（运行时绘制）与菜单
-wpf/Services/SwitchEngine.cs 核心切换逻辑（候选排序、防抖、冷却、回落、手动暂停、频段验证）
-wpf/Services/Wifi.cs         netsh 解析（SSID → BSSID → 频段/信号）与连接
-wpf/Services/Native.cs       DWM 云母、悬浮框样式、WlanScan 主动扫描、按 BSSID 连接
-wpf/Services/AutoStart.cs    任务计划开机自启
-wpf/Services/ThemeService.cs 浅色/深色主题与 Mica
-wpf/Themes/*.xaml            两套配色 + 自绘控件样式
+wpf/Services/SwitchEngine.cs   事件驱动引擎（只做 IO）
+wpf/Services/Decider.cs        纯决策逻辑（候选排序、防抖、冷却、回落、频段验证）
+wpf/Services/WlanClient.cs     原生 WLAN API：读取、通知、连接
+wpf/Services/Wifi.cs           netsh 解析（后备方案）与保存新网络配置
+wpf/Assets/                    应用图标与托盘图标（已连接 / 未连接 / 已暂停）
+
+tauri/src-tauri/src/decide.rs  纯决策逻辑（与 WPF 的 Decider 一一对应；`cargo test` 里有对应的单元测试）
+tauri/src-tauri/src/native.rs  原生 WLAN API（FFI）
+tauri/src-tauri/src/engine.rs  事件驱动引擎线程
+tauri/src-tauri/src/parse.rs   netsh 解析（后备方案）
+tauri/src-tauri/src/{tray,overlay,commands,ops,autostart,netsh,state,util,model}.rs，tests.rs 是决策器/解析器/配置迁移的单元测试
+tauri/src/                     前端（主界面 main.ts、悬浮框 overlay.ts、两套主题 CSS）
 ```
