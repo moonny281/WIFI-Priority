@@ -60,6 +60,46 @@ namespace WifiPriority.Services
             catch { }
         }
 
+        // ---------- 悬浮框层级（置顶 / 沉到桌面） ----------
+        static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+        static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
+        static readonly IntPtr HWND_BOTTOM = new IntPtr(1);
+        const uint SWP_NOSIZE = 0x0001, SWP_NOMOVE = 0x0002, SWP_NOACTIVATE = 0x0010;
+
+        [DllImport("user32.dll")]
+        static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+
+        /// <summary>top = true：置顶（可重复调用来“重申”）；false：取消置顶并沉到最底层。不抢焦点、不改位置和大小。</summary>
+        public static void SetOverlayLayer(IntPtr hwnd, bool top)
+        {
+            try
+            {
+                const uint f = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+                if (top) SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, f);
+                else
+                {
+                    SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, f);
+                    SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, f);
+                }
+            }
+            catch { }
+        }
+
+        // ---------- 前台窗口变化监听（别的窗口被激活后立刻重申置顶） ----------
+        public delegate void WinEventProc(IntPtr hook, uint ev, IntPtr hwnd, int idObj, int idChild, uint thread, uint time);
+        const uint EVENT_SYSTEM_FOREGROUND = 0x0003, WINEVENT_OUTOFCONTEXT = 0x0000;
+
+        [DllImport("user32.dll")]
+        static extern IntPtr SetWinEventHook(uint min, uint max, IntPtr mod, WinEventProc cb, uint pid, uint tid, uint flags);
+
+        [DllImport("user32.dll")]
+        static extern bool UnhookWinEvent(IntPtr hook);
+
+        public static IntPtr HookForeground(WinEventProc cb) =>
+            SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, IntPtr.Zero, cb, 0, 0, WINEVENT_OUTOFCONTEXT);
+
+        public static void Unhook(IntPtr hook) { if (hook != IntPtr.Zero) UnhookWinEvent(hook); }
+
         // ---------- WLAN 主动扫描 ----------
         [DllImport("wlanapi.dll")]
         static extern uint WlanOpenHandle(uint dwClientVersion, IntPtr pReserved, out uint pdwNegotiatedVersion, out IntPtr phClientHandle);

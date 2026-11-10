@@ -39,6 +39,7 @@ pub struct Settings {
     pub overlay_anchor: String,
     pub overlay_x: f64,
     pub overlay_y: f64,
+    pub overlay_layer: String, // Top = 悬浮在所有窗口之上；Desktop = 只在桌面
 }
 
 impl Default for Settings {
@@ -66,6 +67,7 @@ impl Default for Settings {
             overlay_anchor: "TopRight".into(),
             overlay_x: 0.0,
             overlay_y: 0.0,
+            overlay_layer: "Top".into(),
         }
     }
 }
@@ -116,6 +118,9 @@ impl Settings {
             "TopLeft" | "TopRight" | "BottomLeft" | "BottomRight" | "Free"
         ) {
             self.overlay_anchor = "TopRight".into();
+        }
+        if !matches!(self.overlay_layer.as_str(), "Top" | "Desktop") {
+            self.overlay_layer = "Top".into();
         }
         self.priorities.retain(|s| !s.trim().is_empty());
     }
@@ -202,6 +207,8 @@ pub struct EngineStatus {
     pub location_denied: bool,
     pub paused: bool,
     pub paused_until: Option<i64>, // unix 秒；None + paused = 手动无限期暂停
+    pub connecting: bool,          // 正在关联/认证，或程序刚发出连接请求还没落定
+    pub target: Option<String>,    // 程序正在切换到的网络（含频段标签）
     pub message: Option<String>,
     pub native: bool,
     pub nearby: Vec<NearbyNetwork>,

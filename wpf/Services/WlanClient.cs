@@ -113,14 +113,39 @@ namespace WifiPriority.Services
         }
 
         /// <summary>请求所有网卡立即扫描（异步，完成时会收到 Notified(7)）。</summary>
-        public void Scan()
+        /// <summary>返回 true = 至少有一块网卡接受了扫描请求（之后会收到通知 7/8）；false = 不会有通知，调用方不要空等。</summary>
+        public bool Scan()
         {
-            if (_h == IntPtr.Zero) return;
+            if (_h == IntPtr.Zero) return false;
+            bool any = false;
             for (int i = 0; i < _ifaces.Count; i++)
             {
                 Guid g = _ifaces[i];
-                try { WlanScan(_h, ref g, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero); } catch { }
+                try { if (WlanScan(_h, ref g, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero) == 0) any = true; } catch { }
             }
+            return any;
+        }
+
+        /// <summary>定向扫描某个 SSID（发送指向该 SSID 的探测请求）：比泛扫描更快，也能发现隐藏/弱信号网络。</summary>
+        public void ScanDirected(string ssid)
+        {
+            if (_h == IntPtr.Zero || string.IsNullOrEmpty(ssid)) return;
+            var bytes = Encoding.UTF8.GetBytes(ssid);
+            if (bytes.Length == 0 || bytes.Length > 32) return;
+
+            IntPtr p = Marshal.AllocHGlobal(36);               // DOT11_SSID：uSSIDLength(4) + ucSSID[32]
+            try
+            {
+                for (int i = 0; i < 36; i++) Marshal.WriteByte(p, i, 0);
+                Marshal.WriteInt32(p, 0, bytes.Length);
+                Marshal.Copy(bytes, 0, IntPtr.Add(p, 4), bytes.Length);
+                for (int i = 0; i < _ifaces.Count; i++)
+                {
+                    Guid g = _ifaces[i];
+                    try { WlanScan(_h, ref g, p, IntPtr.Zero, IntPtr.Zero); } catch { }
+                }
+            }
+            finally { Marshal.FreeHGlobal(p); }
         }
 
         // ---------- 读取 ----------

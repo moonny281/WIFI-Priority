@@ -216,6 +216,20 @@
 
                     <Border Style="{StaticResource Card}" Margin="0,12,0,0">
                         <StackPanel>
+                            <TextBlock Text="显示层级" Style="{StaticResource H2}"/>
+                            <TextBlock Text="悬浮在所有窗口之上：任何窗口都盖不住它；只显示在桌面：被其他窗口盖住，回到桌面时才看得到。"
+                                       Style="{StaticResource Sub}" Margin="0,4,0,10"/>
+                            <WrapPanel>
+                                <RadioButton x:Name="OvLayerTop" Content="悬浮在所有窗口之上" Tag="Top" GroupName="ovlayer"
+                                             Style="{StaticResource SegButton}" Checked="OverlayLayer_Checked"/>
+                                <RadioButton x:Name="OvLayerDesktop" Content="只显示在桌面" Tag="Desktop" GroupName="ovlayer"
+                                             Style="{StaticResource SegButton}" Checked="OverlayLayer_Checked"/>
+                            </WrapPanel>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Style="{StaticResource Card}" Margin="0,12,0,0">
+                        <StackPanel>
                             <Grid>
                                 <TextBlock Text="透明度" VerticalAlignment="Center"/>
                                 <TextBlock x:Name="OvOpacityText" HorizontalAlignment="Right" Style="{StaticResource Sub}"/>

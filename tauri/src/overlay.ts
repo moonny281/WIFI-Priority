@@ -26,7 +26,10 @@ function render(): void {
   let sub = '';
   let signal = 0;
   if (st) {
-    if (st.locationDenied) {
+    if (st.connecting && st.target) {
+      ssid = `正在切换到 ${st.target}…`;
+      sub = st.connected ? `当前 ${st.ssid ?? ''}` : '正在连接';
+    } else if (st.locationDenied) {
       ssid = '需要开启位置服务';
       sub = 'Windows 需授权才能读取 WiFi';
     } else if (st.connected) {

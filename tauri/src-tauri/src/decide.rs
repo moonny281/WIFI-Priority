@@ -23,6 +23,7 @@ pub struct Plan {
     pub reason: String,
     pub from_label: Option<String>,
     pub to_label: String,
+    pub retried: bool, // true = 这是“指定接入点失败后改为不指定”的重试，不再重试第二次
 }
 
 impl Plan {
@@ -64,6 +65,9 @@ pub struct Decider {
     last_switch: i64,
     last_plan: Option<Plan>,
     last_plan_at: i64,
+    prev_signal: i64,
+    pending_last_seen: i64,
+    last_diag_at: i64,
     bad: BadMap,
 }
 
@@ -158,6 +162,9 @@ impl Decider {
             last_switch: NEVER,
             last_plan: None,
             last_plan_at: 0,
+            prev_signal: 100,
+            pending_last_seen: 0,
+            last_diag_at: NEVER,
             bad: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -171,12 +178,18 @@ impl Decider {
         self.bad.lock().unwrap().insert(key.to_string(), until_ms);
     }
 
+    /// 程序正在切换到的网络（连接请求已发出、结果还没落定）。给悬浮框显示“正在切换到 …”。
+    pub fn active_target(&self) -> Option<String> {
+        self.last_plan.as_ref().map(|p| p.to_label.clone())
+    }
+
     /// 引擎执行连接后回报结果（ok = false 表示系统没有接受连接请求）。
     pub fn connect_result(&mut self, p: &Plan, ok: bool, now: i64) {
         if ok {
             return;
         }
         self.last_plan = None;
+        self.last_switch = NEVER; // 请求根本没发出去，不该占用升级冷却
         self.mark_bad(&p.ssid, now + 120_000);
     }
 
@@ -193,6 +206,22 @@ impl Decider {
             if on_target && band_ok && !st.connecting {
                 self.last_plan = None; // 成功
             } else if el >= SETTLE_MS && !st.connecting {
+                if !on_target && lp.bssid.is_some() && !lp.retried {
+                    // 指定接入点（BSSID）没连上：BSS 列表是缓存，那个接入点可能已经不在了。
+                    // 先退一步只按配置文件重试一次，再决定要不要拉黑。
+                    let retry = Plan {
+                        band: 0,
+                        bssid: None,
+                        reason: format!("{}（指定接入点失败，改为不指定重试）", lp.reason),
+                        retried: true,
+                        ..lp.clone()
+                    };
+                    d.logs.push(format!("指定接入点连接 {} 未成功，改为只按配置文件重试", lp.to_label));
+                    self.last_plan = Some(retry.clone());
+                    self.last_plan_at = now;
+                    d.connect = Some(retry);
+                    return d;
+                }
                 if on_target {
                     self.mark_bad(&lp.key(), now + 600_000);
                     d.logs.push(format!(
@@ -209,15 +238,11 @@ impl Decider {
 
         // 2) 手动换网检测：用户在 Windows 里自己换了网络 → 暂停一段时间，避免和用户对着干
         if st.connected {
-            let manual = match &self.prev {
-                Some(p) => {
-                    *p != st.ssid
-                        && self.expected.as_deref() != Some(st.ssid.as_str())
-                        && s.manual_pause_minutes > 0
-                }
-                None => false,
-            };
-            if manual {
+            let changed = self.prev.as_deref().map(|p| p != st.ssid).unwrap_or(false);
+            let expected = self.expected.as_deref() == Some(st.ssid.as_str());
+            // 换网之前原网络信号就已低于回落阈值：这是 Windows 自己在信号变差时漫游，不是用户手动换网
+            let sys_roam = self.prev_signal < s.down_threshold;
+            if changed && !expected && !sys_roam && s.manual_pause_minutes > 0 {
                 d.pause_minutes = s.manual_pause_minutes;
                 paused = true;
                 self.pending_key = None;
@@ -225,8 +250,14 @@ impl Decider {
                     "检测到网络被手动切换到 {}，自动切换暂停 {} 分钟",
                     st.ssid, s.manual_pause_minutes
                 ));
+            } else if changed && !expected && sys_roam {
+                d.logs.push(format!(
+                    "系统自行切换到 {}（原网络信号已低于回落阈值），不视为手动换网",
+                    st.ssid
+                ));
             }
             self.prev = Some(st.ssid.clone());
+            self.prev_signal = st.signal;
         } else {
             self.prev = None;
         }
@@ -282,17 +313,54 @@ impl Decider {
         };
 
         order(&mut cands, policy, prefer24);
-        let best = match cands.iter().find(|c| usable(c)) {
-            Some(b) => b,
-            None => {
+        let best_opt = cands.iter().find(|c| usable(c));
+
+        // 诊断：排在当前网络前面的候选被挡住时，说明原因（同一原因 30 秒最多一条），免得用户看不出“为什么没切”
+        let held = match best_opt {
+            None => true,
+            Some(b) => is_current(b),
+        };
+        if held && now - self.last_diag_at > 30_000 {
+            let why = |c: &Cand| -> Option<String> {
+                if is_bad(c) {
+                    return Some("处于失败冷却中".to_string());
+                }
+                let saved = !c.profile.is_empty()
+                    && (st.profiles.contains(&c.profile) || st.profiles.contains(&c.ssid));
+                if !saved && !is_current(c) {
+                    return Some("没有已保存的配置文件".to_string());
+                }
+                let th = if relaxed { s.down_threshold } else { s.up_threshold };
+                if c.signal < th {
+                    return Some(format!(
+                        "信号 {}% 低于{}阈值 {}%",
+                        c.signal,
+                        if relaxed { "回落" } else { "升级" },
+                        th
+                    ));
+                }
+                None
+            };
+            let cur_pos = cands.iter().position(|c| is_current(c)).unwrap_or(cands.len());
+            let blocked = cands.iter().take(cur_pos).find_map(|c| why(c).map(|w| (label(&c.ssid, c.band), w)));
+            if let Some((lb, w)) = blocked {
+                self.last_diag_at = now;
+                d.logs.push(format!("优先网络 {} 暂不切换：{}", lb, w));
+            }
+        }
+
+        let best = match best_opt {
+            Some(b) if !is_current(b) => b,
+            _ => {
+                // 没有可切换的候选，或最优的就是当前网络。
+                // 候选只是短暂掉出阈值（信号在阈值线上下抖动，≤1.5 秒）：保留确认计时，不要清零
+                if self.pending_key.is_some() && now - self.pending_last_seen < 1500 {
+                    return d;
+                }
                 self.pending_key = None;
                 return d;
             }
         };
-        if is_current(best) {
-            self.pending_key = None;
-            return d;
-        }
         if cur.is_some() && !cur_listed && !s.takeover_unlisted {
             self.pending_key = None;
             return d;
@@ -322,6 +390,7 @@ impl Decider {
                 self.pending_key = Some(best_key.clone());
                 self.pending_since = now;
             }
+            self.pending_last_seen = now;
             let wait_confirm = now - self.pending_since < s.confirm_ms.max(0);
             let cooling = (cur_ok || !cur_listed) && now - self.last_switch < s.cooldown_sec.max(0) * 1000;
             if wait_confirm || cooling {
@@ -338,9 +407,12 @@ impl Decider {
             reason,
             from_label: cur.map(|c| label(c, st.cur_band)),
             to_label: label(&best.ssid, best.band),
+            retried: false,
         };
         self.pending_key = None;
-        self.last_switch = now;
+        if cur.is_some() {
+            self.last_switch = now; // 只有“从一个网络换到另一个”才进入升级冷却；从未连接状态连上不算
+        }
         self.last_plan = Some(plan.clone());
         self.last_plan_at = now;
         self.expected = Some(plan.ssid.clone());

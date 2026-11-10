@@ -317,6 +317,14 @@ namespace WifiPriority
         }
 
         // ================= 桌面悬浮框 =================
+        void OverlayLayer_Checked(object sender, RoutedEventArgs e)
+        {
+            if (!_ready || _loading) return;
+            S.OverlayLayer = (string)((RadioButton)sender).Tag == "Desktop" ? "Desktop" : "Top";
+            App.SaveSettings();
+            App.Overlay.ApplySettings();
+        }
+
         void Overlay_Changed(object sender, RoutedEventArgs e)
         {
             if (!_ready || _loading) return;
@@ -373,6 +381,8 @@ namespace WifiPriority
             OvEnabled.IsChecked = S.OverlayEnabled;
             OvShowSignal.IsChecked = S.OverlayShowSignal;
             OvLocked.IsChecked = S.OverlayLocked;
+            OvLayerTop.IsChecked = S.OverlayLayer != "Desktop";
+            OvLayerDesktop.IsChecked = S.OverlayLayer == "Desktop";
             OvOpacity.Value = S.OverlayOpacity;
             OvScale.Value = S.OverlayScale;
             OvOpacityText.Text = $"{S.OverlayOpacity * 100:0}%";

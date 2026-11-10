@@ -41,6 +41,7 @@ namespace WifiPriority.Models
         public string OverlayAnchor { get; set; } = "TopRight"; // TopLeft/TopRight/BottomLeft/BottomRight/Free
         public double OverlayX { get; set; } = 0;
         public double OverlayY { get; set; } = 0;
+        public string OverlayLayer { get; set; } = "Top";  // Top = 悬浮在所有窗口之上；Desktop = 只在桌面
     }
 
     public static class SettingsStore

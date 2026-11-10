@@ -78,6 +78,13 @@ const TEMPLATE = `
         <label class="switch"><input type="checkbox" data-setting="OverlayLocked" /><span>锁定位置并鼠标穿透（悬浮框不再响应点击，需在此处或托盘菜单解锁）</span></label>
       </div>
       <div class="card">
+        <h2>显示层级</h2>
+        <div class="sub mt8" style="margin-bottom:12px">悬浮在所有窗口之上：任何窗口都盖不住它；只显示在桌面：被其他窗口盖住，回到桌面时才看得到。</div>
+        <div class="seg" data-setting="OverlayLayer">
+          <button data-value="Top">悬浮在所有窗口之上</button><button data-value="Desktop">只显示在桌面</button>
+        </div>
+      </div>
+      <div class="card">
         <div class="slider-head"><span>透明度</span><span class="sub" id="ov-opacity-text"></span></div>
         <input type="range" min="0.3" max="1" step="0.01" data-setting="OverlayOpacity" />
         <div class="slider-head mt16"><span>大小</span><span class="sub" id="ov-scale-text"></span></div>

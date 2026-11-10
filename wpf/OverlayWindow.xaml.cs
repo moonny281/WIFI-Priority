@@ -3,6 +3,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Interop;
+using System.Windows.Threading;
 using WifiPriority.Models;
 using WifiPriority.Services;
 
@@ -13,13 +14,51 @@ namespace WifiPriority
     {
         readonly AppSettings S;
 
+        // 层级：置顶模式下，别的置顶窗口出现后悬浮框不会自己回到最上面，所以要“重申”
+        readonly DispatcherTimer _topTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
+        Native.WinEventProc _fgProc;          // 必须持有引用，否则会被 GC 回收
+        IntPtr _fgHook = IntPtr.Zero;
+
+        bool IsTopLayer => S.OverlayLayer != "Desktop";
+
         public OverlayWindow(AppSettings s)
         {
             S = s;
             InitializeComponent();
-            SourceInitialized += (a, b) => ApplyNativeStyles();
+            SourceInitialized += (a, b) => { ApplyNativeStyles(); ApplyLayer(); };
             SizeChanged += (a, b) => Reposition();
             Root.MouseLeftButtonDown += Root_MouseLeftButtonDown;
+
+            _topTimer.Tick += (a, b) => { if (IsVisible && IsTopLayer) ApplyLayer(); };
+            _fgProc = (h, ev, hw, o, c, t, tm) =>
+            {
+                // 别的窗口刚被激活：等它自己的置顶动作做完再重申，所以放到较低优先级执行
+                Dispatcher.BeginInvoke(new Action(() => { if (IsVisible && IsTopLayer) ApplyLayer(); }), DispatcherPriority.Background);
+            };
+            Closed += (a, b) => { _topTimer.Stop(); Native.Unhook(_fgHook); _fgHook = IntPtr.Zero; };
+        }
+
+        /// <summary>应用/重申层级：Top = 悬浮在所有窗口之上；Desktop = 只在桌面（被普通窗口盖住）。</summary>
+        void ApplyLayer()
+        {
+            var h = new WindowInteropHelper(this).EnsureHandle();
+            Topmost = IsTopLayer;                 // 让 WPF 的属性和实际状态一致
+            Native.SetOverlayLayer(h, IsTopLayer);
+        }
+
+        void UpdateLayerWatchers()
+        {
+            if (IsTopLayer && S.OverlayEnabled)
+            {
+                if (!_topTimer.IsEnabled) _topTimer.Start();
+                if (_fgHook == IntPtr.Zero) _fgHook = Native.HookForeground(_fgProc);
+            }
+            else
+            {
+                _topTimer.Stop();
+                Native.Unhook(_fgHook);
+                _fgHook = IntPtr.Zero;
+            }
         }
 
         void ApplyNativeStyles()
@@ -42,11 +81,14 @@ namespace WifiPriority
                 if (!IsVisible) Show();
                 UpdateLayout();
                 Reposition();
+                ApplyLayer();                     // 每次显示 / 设置变化都重申层级
             }
             else if (IsVisible)
             {
                 Hide();
             }
+
+            UpdateLayerWatchers();
         }
 
         public void SetAnchor(string anchor)
@@ -95,7 +137,13 @@ namespace WifiPriority
 
         public void UpdateStatus(EngineStatus st)
         {
-            if (st.LocationDenied)
+            if (st.Connecting && st.Target != null)
+            {
+                SsidText.Text = "正在切换到 " + st.Target + "…";
+                SubText.Text = st.Connected ? "当前 " + st.Ssid : "正在连接";
+                Bars.Value = 0;
+            }
+            else if (st.LocationDenied)
             {
                 SsidText.Text = "需要开启位置服务";
                 SubText.Text = "Windows 需授权才能读取 WiFi";

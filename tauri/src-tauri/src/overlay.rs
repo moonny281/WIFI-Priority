@@ -14,8 +14,21 @@ pub fn apply(app: &AppHandle, sh: &Arc<Shared>) {
         if s.overlay_enabled {
             let _ = w.show();
             reposition(app, sh);
+            apply_layer(app, sh);
         } else {
             let _ = w.hide();
+        }
+    }
+}
+
+/// 应用/重申悬浮框层级：Top = 悬浮在所有窗口之上；Desktop = 只在桌面（被普通窗口盖住）。
+/// 置顶模式下会被定时重复调用（见 main.rs），因为别的置顶窗口出现后悬浮框不会自己回到最上面。
+pub fn apply_layer(app: &AppHandle, sh: &Arc<Shared>) {
+    let top = sh.settings.lock().unwrap().overlay_layer != "Desktop";
+    if let Some(w) = app.get_webview_window("overlay") {
+        let _ = w.set_always_on_top(top);
+        if let Ok(h) = w.hwnd() {
+            native::set_layer(h.0 as isize, top); // h.0 在不同 windows crate 版本里是指针或整数，as isize 两者都能转
         }
     }
 }

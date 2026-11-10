@@ -1,6 +1,6 @@
 [package]
 name = "wifi-priority"
-version = "1.1.1"
+version = "1.1.2"
 description = "按优先级自动切换 WiFi，5G 优先，毫秒级响应"
 edition = "2021"
 

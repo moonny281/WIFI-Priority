@@ -158,11 +158,22 @@ impl<H: Host> Engine<H> {
         if self.scan_busy && now - self.last_scan_at < 6000 {
             return; // 上一次扫描还没完成
         }
-        self.scan_busy = true;
         self.last_scan_at = now;
+        let mut ok = false;
         if let Some(c) = &self.client {
-            c.scan();
+            ok = c.scan();
+            // 对排在当前网络前面的优先网络做定向扫描（最多 5 个），更快发现新出现的高优先级网络
+            let cur = self.cur_ssid.lock().ok().and_then(|g| g.clone());
+            let limit = match &cur {
+                Some(cs) => s.priorities.iter().position(|p| p == cs).unwrap_or(s.priorities.len()),
+                None => s.priorities.len(),
+            };
+            for p in s.priorities.iter().take(limit.min(5)) {
+                c.scan_directed(p);
+            }
         }
+        // 请求没被接受就不会有“扫描完成”通知，别把 scan_busy 挂着空等
+        self.scan_busy = ok;
     }
 
     /// 一轮：读状态 → 决策 → 执行。返回下一轮前的等待毫秒数。
@@ -299,14 +310,18 @@ impl<H: Host> Engine<H> {
     // ---------- 发布给界面（限频：状态没变化时每 2 秒一次） ----------
     fn publish(&mut self, st: &WifiState, force: bool) {
         let paused = self.sh.is_paused();
+        let target = self.dec.active_target();
+        let connecting = st.connecting || target.is_some();
         let sig = format!(
-            "{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
             st.connected,
             st.ssid,
             st.cur_band,
             st.signal,
             paused,
             st.location_denied,
+            connecting,
+            target.as_deref().unwrap_or(""),
             st.nearby.iter().map(|n| format!("{}:{}", n.ssid, n.signal)).collect::<Vec<_>>().join(",")
         );
         let now = now_ms();
@@ -330,6 +345,8 @@ impl<H: Host> Engine<H> {
             location_denied: st.location_denied,
             paused,
             paused_until: self.sh.paused_until_opt(),
+            connecting,
+            target,
             message: if st.location_denied {
                 Some("位置服务未开启".to_string())
             } else if st.nearby.is_empty() && !st.connected {

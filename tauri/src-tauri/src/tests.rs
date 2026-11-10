@@ -117,10 +117,16 @@ fn t7_no_duplicate_requests_and_failure_marks_bad() {
     let w = st(Some(("B", 2, 70)), &[("A", 2, 80), ("B", 2, 70)]);
     assert_eq!(d.decide(&w, &s, 1000, false).connect.map(|p| p.ssid), Some("A".to_string()));
     assert!(d.decide(&w, &s, 1300, false).connect.is_none());
+    // v1.1.2：指定接入点（BSSID）的连接 4 秒没落定 → 先改为不指定接入点重试一次，而不是直接拉黑
     let r = d.decide(&w, &s, 5200, false);
+    let retry = r.connect.expect("retry without bssid");
+    assert_eq!((retry.ssid.as_str(), retry.bssid.is_none(), retry.retried), ("A", true, true));
+    assert!(d.decide(&w, &s, 5300, false).connect.is_none());
+    // 重试也没成功 → 才拉黑
+    let r = d.decide(&w, &s, 9300, false);
     assert!(r.connect.is_none());
     assert!(r.logs.iter().any(|l| l.contains("没有成功")));
-    assert!(d.decide(&w, &s, 6000, false).connect.is_none());
+    assert!(d.decide(&w, &s, 10000, false).connect.is_none());
 }
 
 #[test]
@@ -169,6 +175,89 @@ fn t12_unsaved_network_ignored() {
     let mut w = st(Some(("B", 2, 70)), &[("A", 5, 90), ("B", 2, 70)]);
     w.profiles.remove("A");
     assert!(d.decide(&w, &cfg("Global", "5G", 0, &["A", "B"]), 1000, false).connect.is_none());
+}
+
+#[test]
+fn t13_system_roam_is_not_manual_change() {
+    // 原网络信号已低于回落阈值，Windows 自己漫游到别的网络：不应暂停自动切换
+    let mut d = Decider::new();
+    let s = cfg("Global", "5G", 0, &["Home"]);
+    d.decide(&st(Some(("Home", 5, 30)), &[("Home", 5, 30), ("Other", 5, 90)]), &s, 1000, false);
+    let r = d.decide(&st(Some(("Other", 5, 90)), &[("Home", 5, 30), ("Other", 5, 90)]), &s, 2000, false);
+    assert_eq!(r.pause_minutes, 0);
+    assert!(r.logs.iter().any(|l| l.contains("系统自行切换")));
+}
+
+#[test]
+fn t14_candidate_flicker_keeps_confirm_timer() {
+    // 候选信号在升级阈值上下抖动：短暂掉出阈值（<1.5 秒）不应清零确认计时
+    let mut d = Decider::new();
+    let s = cfg("Global", "5G", 400, &["A", "B"]);
+    let up = st(Some(("B", 2, 70)), &[("A", 2, 80), ("B", 2, 70)]);
+    let dip = st(Some(("B", 2, 70)), &[("A", 2, 55), ("B", 2, 70)]);
+    assert!(d.decide(&up, &s, 1000, false).connect.is_none()); // 开始计时
+    assert!(d.decide(&dip, &s, 1200, false).connect.is_none()); // 抖了一下
+    let p = d.decide(&up, &s, 1500, false).connect; // 距离首次最优已 500ms
+    assert_eq!(p.map(|p| p.ssid), Some("A".to_string()));
+}
+
+#[test]
+fn t15_first_connect_does_not_start_upgrade_cooldown() {
+    // 从未连接状态连上（不算“升级”），紧接着出现更高优先级网络，不应被 8 秒冷却拦住
+    let mut d = Decider::new();
+    let s = cfg("Global", "5G", 0, &["A", "B"]);
+    let p = d.decide(&st(None, &[("B", 2, 70)]), &s, 1000, false).connect.expect("connect B");
+    assert_eq!(p.ssid, "B");
+    d.connect_result(&p, true, 1000);
+    let w = st(Some(("B", 2, 70)), &[("A", 2, 80), ("B", 2, 70)]);
+    assert_eq!(d.decide(&w, &s, 1300, false).connect.map(|p| p.ssid), Some("A".to_string()));
+}
+
+#[test]
+fn t16_blocked_by_threshold_is_explained() {
+    // 更高优先级网络信号不够升级阈值：不切换，但日志里要说明原因
+    let mut d = Decider::new();
+    let s = cfg("Global", "5G", 0, &["A", "B"]);
+    let w = st(Some(("B", 2, 70)), &[("A", 2, 50), ("B", 2, 70)]);
+    let r = d.decide(&w, &s, 1000, false);
+    assert!(r.connect.is_none());
+    assert!(r.logs.iter().any(|l| l.contains("暂不切换") && l.contains("升级阈值")));
+    // 同一原因 30 秒内不重复刷屏
+    assert!(d.decide(&w, &s, 2000, false).logs.is_empty());
+}
+
+#[test]
+fn t17_failed_request_does_not_consume_cooldown() {
+    let mut d = Decider::new();
+    let s = cfg("Global", "5G", 0, &["A", "B"]);
+    let w = st(Some(("B", 2, 70)), &[("A", 2, 80), ("B", 2, 70)]);
+    let p = d.decide(&w, &s, 1000, false).connect.expect("switch to A");
+    d.connect_result(&p, false, 1000); // 系统没接受请求
+    // 清掉拉黑标记模拟“稍后重试”，冷却不应还在占用
+    d.mark_bad("A", 0);
+    assert!(d.decide(&w, &s, 1100, false).connect.is_some());
+}
+
+#[test]
+fn t18_active_target_reports_pending_switch() {
+    let mut d = Decider::new();
+    let s = cfg("Global", "5G", 0, &["A", "B"]);
+    let w = st(Some(("B", 2, 70)), &[("A", 2, 80), ("B", 2, 70)]);
+    assert!(d.active_target().is_none());
+    d.decide(&w, &s, 1000, false);
+    assert_eq!(d.active_target().as_deref(), Some("A（2.4G）"));
+}
+
+#[test]
+fn s5_overlay_layer_default_and_sanitize() {
+    let mut s = Settings::fresh();
+    assert_eq!(s.overlay_layer, "Top");
+    s.overlay_layer = "weird".into();
+    s.sanitize();
+    assert_eq!(s.overlay_layer, "Top");
+    // 旧配置文件没有这个字段 → 取默认值
+    let old = Settings::from_json(r#"{"SchemaVersion":2,"Priorities":["Home"]}"#).unwrap();
+    assert_eq!(old.overlay_layer, "Top");
 }
 
 // ---------------- netsh 解析 ----------------

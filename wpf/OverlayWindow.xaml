@@ -4,7 +4,7 @@
         xmlns:c="clr-namespace:WifiPriority.Controls"
         Title="WiFi 悬浮框"
         WindowStyle="None" AllowsTransparency="True" Background="Transparent"
-        ShowInTaskbar="False" Topmost="True" ResizeMode="NoResize"
+        ShowInTaskbar="False" ResizeMode="NoResize"
         SizeToContent="WidthAndHeight" ShowActivated="False" Focusable="False"
         WindowStartupLocation="Manual" UseLayoutRounding="True"
         FontFamily="{StaticResource UiFont}" FontSize="13"

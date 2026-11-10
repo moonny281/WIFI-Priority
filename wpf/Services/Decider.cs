@@ -14,6 +14,7 @@ namespace WifiPriority.Services
         public int Iface = -1;
         public string Profile;
         public string Reason, FromLabel, ToLabel;
+        public bool Retried;        // true = 指定接入点失败后“不指定接入点”的重试，不再重试第二次
     }
 
     public class Decision
@@ -50,7 +51,13 @@ namespace WifiPriority.Services
         long _lastSwitch = Never;
         Plan _lastPlan;
         long _lastPlanAt;
+        int _prevSignal = 100;      // 上一次评估时当前网络的信号（判断“换网前原网络是不是已经很差”）
+        long _pendingLastSeen;      // 候选最后一次被选为最优的时间（信号在阈值线上抖动时保留确认计时）
+        long _lastDiagAt = Never;   // 上一次写“为什么没切”诊断日志的时间
         readonly Dictionary<string, long> _bad = new Dictionary<string, long>();
+
+        /// <summary>程序正在切换到的网络（连接请求已发出、结果还没落定），给悬浮框显示“正在切换到 …”。</summary>
+        public string ActiveTarget => _lastPlan?.ToLabel;
 
         public void MarkBad(string key, long untilMs) { lock (_bad) _bad[key] = untilMs; }
 
@@ -64,6 +71,7 @@ namespace WifiPriority.Services
         {
             if (ok) return;
             _lastPlan = null;
+            _lastSwitch = Never;   // 请求根本没发出去，不该占用升级冷却
             MarkBad(p.Ssid, now + 120000);
         }
 
@@ -133,6 +141,23 @@ namespace WifiPriority.Services
                 }
                 else if (el >= SettleMs && !st.Connecting)
                 {
+                    if (!onTarget && _lastPlan.Bssid != null && !_lastPlan.Retried)
+                    {
+                        // 指定接入点（BSSID）没连上：BSS 列表是缓存，那个接入点可能已经不在了。
+                        // 先退一步只按配置文件重试一次，再决定要不要拉黑。
+                        var lp = _lastPlan;
+                        var retry = new Plan
+                        {
+                            Ssid = lp.Ssid, Band = 0, Bssid = null, Iface = lp.Iface, Profile = lp.Profile,
+                            Reason = lp.Reason + "（指定接入点失败，改为不指定重试）",
+                            FromLabel = lp.FromLabel, ToLabel = lp.ToLabel, Retried = true
+                        };
+                        d.Logs.Add($"指定接入点连接 {lp.ToLabel} 未成功，改为只按配置文件重试");
+                        _lastPlan = retry;
+                        _lastPlanAt = now;
+                        d.Connect = retry;
+                        return d;
+                    }
                     if (onTarget)
                     {
                         MarkBad(_lastPlan.Key(), now + 600000);
@@ -150,14 +175,21 @@ namespace WifiPriority.Services
             // 2) 手动换网检测：用户在 Windows 里自己换了网络 → 暂停一段时间，避免和用户对着干
             if (st.Connected)
             {
-                if (_prev != null && st.Ssid != _prev && st.Ssid != _expected && s.ManualPauseMinutes > 0)
+                bool changed = _prev != null && st.Ssid != _prev;
+                bool expected = st.Ssid == _expected;
+                // 换网之前原网络信号就已低于回落阈值：这是 Windows 自己在信号变差时漫游，不是用户手动换网
+                bool sysRoam = _prevSignal < s.DownThreshold;
+                if (changed && !expected && !sysRoam && s.ManualPauseMinutes > 0)
                 {
                     d.PauseMinutes = s.ManualPauseMinutes;
                     paused = true;
                     ResetPending();
                     d.Logs.Add($"检测到网络被手动切换到 {st.Ssid}，自动切换暂停 {s.ManualPauseMinutes} 分钟");
                 }
+                else if (changed && !expected && sysRoam)
+                    d.Logs.Add($"系统自行切换到 {st.Ssid}（原网络信号已低于回落阈值），不视为手动换网");
                 _prev = st.Ssid;
+                _prevSignal = st.Signal;
             }
             else _prev = null;
 
@@ -193,8 +225,43 @@ namespace WifiPriority.Services
                 return c.Signal >= th;
             }
 
-            var best = Order(cands, policy, prefer24).FirstOrDefault(Usable);
-            if (best == null || IsCurrent(best)) { ResetPending(); return d; }
+            string WhyNot(Cand c)
+            {
+                if (IsBad(c)) return "处于失败冷却中";
+                bool saved = !string.IsNullOrEmpty(c.Profile) && (st.Profiles.Contains(c.Profile) || st.Profiles.Contains(c.Ssid));
+                if (!saved && !IsCurrent(c)) return "没有已保存的配置文件";
+                int th = relaxed ? s.DownThreshold : s.UpThreshold;
+                string kind = relaxed ? "回落" : "升级";
+                return c.Signal < th ? $"信号 {c.Signal}% 低于{kind}阈值 {th}%" : null;
+            }
+
+            var ordered = Order(cands, policy, prefer24).ToList();
+            var best = ordered.FirstOrDefault(Usable);
+
+            // 诊断：排在当前网络前面的候选被挡住时，说明原因（30 秒最多一条），免得用户看不出“为什么没切”
+            bool held = best == null || IsCurrent(best);
+            if (held && now - _lastDiagAt > 30000)
+            {
+                int cp = ordered.FindIndex(IsCurrent);
+                if (cp < 0) cp = ordered.Count;
+                for (int i = 0; i < cp; i++)
+                {
+                    string why = WhyNot(ordered[i]);
+                    if (why == null) continue;
+                    _lastDiagAt = now;
+                    d.Logs.Add($"优先网络 {Label(ordered[i].Ssid, ordered[i].Band)} 暂不切换：{why}");
+                    break;
+                }
+            }
+
+            if (best == null || IsCurrent(best))
+            {
+                // 没有可切换的候选，或最优的就是当前网络。
+                // 候选只是短暂掉出阈值（信号在阈值线上下抖动，≤1.5 秒）：保留确认计时，不要清零
+                if (_pendingKey != null && now - _pendingLastSeen < 1500) return d;
+                ResetPending();
+                return d;
+            }
             if (cur != null && !curListed && !s.TakeoverUnlisted) { ResetPending(); return d; }
 
             bool sameSsid = cur != null && best.Ssid == cur;
@@ -207,6 +274,7 @@ namespace WifiPriority.Services
             if (cur != null)
             {
                 if (_pendingKey != best.Key) { _pendingKey = best.Key; _pendingSince = now; }
+                _pendingLastSeen = now;
                 bool waitConfirm = now - _pendingSince < Math.Max(0, s.ConfirmMs);
                 bool cooling = (curOk || !curListed) && now - _lastSwitch < Math.Max(0, s.CooldownSec) * 1000L;
                 if (waitConfirm || cooling) return d;
@@ -220,7 +288,7 @@ namespace WifiPriority.Services
                 Reason = reason, FromLabel = fromLabel, ToLabel = Label(best.Ssid, best.Band)
             };
             ResetPending();
-            _lastSwitch = now;
+            if (cur != null) _lastSwitch = now;   // 只有“从一个网络换到另一个”才进入升级冷却；从未连接状态连上不算
             _lastPlan = plan;
             _lastPlanAt = now;
             _expected = plan.Ssid;

@@ -132,6 +132,21 @@ fn main() {
                 });
             }
 
+            // 悬浮框置顶兜底：置顶模式下每 2 秒重申一次层级（别的置顶窗口出现后悬浮框不会自己回到最上面）
+            {
+                let (a, s) = (handle.clone(), sh.clone());
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(Duration::from_secs(2));
+                    let (on, top) = {
+                        let g = s.settings.lock().unwrap();
+                        (g.overlay_enabled, g.overlay_layer != "Desktop")
+                    };
+                    if on && top {
+                        overlay::apply_layer(&a, &s);
+                    }
+                });
+            }
+
             if !background {
                 let _ = main.show();
                 let _ = main.set_focus();

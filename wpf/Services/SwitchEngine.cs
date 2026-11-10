@@ -105,9 +105,17 @@ namespace WifiPriority.Services
             long gap = _s.ScanIntervalSec <= 0 ? 400 : _s.ScanIntervalSec * 1000L;
             if (now - _lastScanAt < gap) return;
             if (_scanBusy && now - _lastScanAt < 6000) return;      // 上一次扫描还没完成
-            _scanBusy = true;
             _lastScanAt = now;
-            _wlan.Scan();
+            bool ok = _wlan.Scan();
+
+            // 对排在当前网络前面的优先网络做定向扫描（最多 5 个），更快发现新出现的高优先级网络
+            var pri = _s.Priorities.ToList();
+            string cur = _curSsid;
+            int limit = cur == null ? pri.Count : pri.IndexOf(cur);
+            if (limit < 0) limit = pri.Count;
+            for (int i = 0; i < limit && i < 5; i++) _wlan.ScanDirected(pri[i]);
+
+            _scanBusy = ok;   // 请求没被接受就不会有“扫描完成”通知，别挂着空等
         }
 
         /// <summary>确保“当前连接”出现在附近网络里，并以网卡上报的信号为准。</summary>
@@ -224,7 +232,9 @@ namespace WifiPriority.Services
         // ---------- 发布给界面（限频：状态没变化时每 2 秒一次） ----------
         void Publish(WifiState st, bool force)
         {
-            string sig = $"{st.Connected}|{st.Ssid}|{st.CurBand}|{st.Signal}|{Paused}|{st.LocationDenied}|"
+            string target = _dec.ActiveTarget;
+            bool connecting = st.Connecting || target != null;
+            string sig = $"{st.Connected}|{st.Ssid}|{st.CurBand}|{st.Signal}|{Paused}|{st.LocationDenied}|{connecting}|{target}|"
                 + string.Join(",", st.Nearby.Select(n => n.Ssid + ":" + n.Signal));
             long now = Now;
             if (!force && sig == _lastSig && now - _lastPublishAt < 2000) return;
@@ -241,6 +251,8 @@ namespace WifiPriority.Services
                 LocationDenied = st.LocationDenied,
                 Paused = Paused,
                 PausedUntil = PausedUntil,
+                Connecting = connecting,
+                Target = target,
                 Nearby = st.Nearby.OrderByDescending(x => x.Signal).ToList(),
                 Profiles = st.Profiles,
                 Message = st.LocationDenied ? "位置服务未开启"

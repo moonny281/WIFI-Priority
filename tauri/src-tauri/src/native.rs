@@ -185,10 +185,32 @@ impl Client {
     }
 
     /// 请求所有网卡立即扫描（异步，完成时会收到通知 code = 7）。
-    pub fn scan(&self) {
+    /// 返回 true = 至少有一块网卡接受了扫描请求（之后会收到通知 7/8）；false = 没有收到任何通知的可能，调用方不要空等。
+    pub fn scan(&self) -> bool {
+        let mut any = false;
         for g in &self.ifaces {
             unsafe {
-                WlanScan(self.h, g.as_ptr(), null_mut(), null_mut(), null_mut());
+                if WlanScan(self.h, g.as_ptr(), null_mut(), null_mut(), null_mut()) == 0 {
+                    any = true;
+                }
+            }
+        }
+        any
+    }
+
+    /// 定向扫描某个 SSID（发送指向该 SSID 的探测请求）：比泛扫描更快，也能发现隐藏/弱信号网络。
+    pub fn scan_directed(&self, ssid: &str) {
+        let bytes = ssid.as_bytes();
+        if bytes.is_empty() || bytes.len() > 32 {
+            return;
+        }
+        // DOT11_SSID：uSSIDLength(4) + ucSSID[32]
+        let mut buf = [0u8; 36];
+        buf[0..4].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+        buf[4..4 + bytes.len()].copy_from_slice(bytes);
+        for g in &self.ifaces {
+            unsafe {
+                WlanScan(self.h, g.as_ptr(), buf.as_mut_ptr() as *mut c_void, null_mut(), null_mut());
             }
         }
     }
@@ -447,4 +469,28 @@ pub fn work_area() -> (i32, i32, i32, i32) {
 /// 虚拟屏幕（所有显示器）：x, y, width, height（物理像素）。
 pub fn virtual_screen() -> (i32, i32, i32, i32) {
     unsafe { (GetSystemMetrics(76), GetSystemMetrics(77), GetSystemMetrics(78), GetSystemMetrics(79)) }
+}
+
+// ---------- 悬浮框层级（置顶 / 沉到桌面） ----------
+#[link(name = "user32")]
+extern "system" {
+    fn SetWindowPos(hwnd: isize, after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
+}
+
+const HWND_TOPMOST: isize = -1;
+const HWND_NOTOPMOST: isize = -2;
+const HWND_BOTTOM: isize = 1;
+// SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS（异步：UI 线程忙时不会把调用线程卡住）
+const LAYER_FLAGS: u32 = 0x0001 | 0x0002 | 0x0010 | 0x4000;
+
+/// top = true：置顶（可重复调用来“重申”）；false：取消置顶并沉到最底层。不抢焦点、不改位置和大小。
+pub fn set_layer(hwnd: isize, top: bool) {
+    unsafe {
+        if top {
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, LAYER_FLAGS); // 不带 SHOWWINDOW：已隐藏的悬浮框不会被重申动作重新弹出来
+        } else {
+            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, LAYER_FLAGS);
+            SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, LAYER_FLAGS);
+        }
+    }
 }

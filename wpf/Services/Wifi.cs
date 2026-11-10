@@ -59,6 +59,8 @@ namespace WifiPriority.Services
         public bool LocationDenied;
         public bool Paused;
         public DateTime? PausedUntil;   // null 且 Paused = 手动无限期暂停
+        public bool Connecting;         // 正在关联/认证，或程序刚发出连接请求还没落定
+        public string Target;           // 程序正在切换到的网络（含频段标签）
         public string Message;
         public List<NearbyNetwork> Nearby = new List<NearbyNetwork>();
         public HashSet<string> Profiles = new HashSet<string>();

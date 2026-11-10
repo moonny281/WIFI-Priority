@@ -25,6 +25,7 @@ export interface Settings {
   OverlayAnchor: string;
   OverlayX: number;
   OverlayY: number;
+  OverlayLayer: 'Top' | 'Desktop';
 }
 
 export interface Bss {
@@ -54,6 +55,8 @@ export interface Status {
   locationDenied: boolean;
   paused: boolean;
   pausedUntil: number | null;
+  connecting: boolean;
+  target: string | null;
   message: string | null;
   native: boolean;
   nearby: Nearby[];
