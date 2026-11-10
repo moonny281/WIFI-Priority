@@ -23,7 +23,7 @@ namespace WifiPriority.Models
 
         // 频段偏好
         // BandPolicy: Off = 不区分频段；Same = 仅同一网络内优先偏好频段；Global = 全局偏好频段的网络优先
-        public string BandPolicy { get; set; } = "Global";
+        public string BandPolicy { get; set; } = "Same";
         public string PreferBand { get; set; } = "5G";     // 5G（6G > 5G > 2.4G）或 2.4G
 
         // 外观
@@ -46,7 +46,10 @@ namespace WifiPriority.Models
 
     public static class SettingsStore
     {
-        const int CurrentSchema = 2;
+        const int CurrentSchema = 3;
+
+        /// <summary>启动时把旧配置里的“频段策略”从 Global 迁移成了 Same（引擎启动后写一条日志告知用户）。</summary>
+        public static bool BandPolicyMigrated;
 
         static readonly object Lk = new object();
 
@@ -67,10 +70,20 @@ namespace WifiPriority.Models
                         if (s.Priorities == null) s.Priorities = new List<string>();
                         if (s.SchemaVersion < CurrentSchema)
                         {
-                            // v1.1.1：毫秒级切换，旧版的 10 秒/2 次/60 秒默认值会拖慢切换，统一迁移
-                            s.ScanIntervalSec = 3;
-                            s.ConfirmMs = 400;
-                            s.CooldownSec = 8;
+                            if (s.SchemaVersion < 2)
+                            {
+                                // v1.1.1：毫秒级切换，旧版的 10 秒/2 次/60 秒默认值会拖慢切换
+                                s.ScanIntervalSec = 3;
+                                s.ConfirmMs = 400;
+                                s.CooldownSec = 8;
+                            }
+                            // v1.1.3：旧默认“全局偏好频段优先”会让当前的 5G 网络排到列表里更靠前的 2.4G 网络之前，
+                            // 于是更高优先级的网络出现时“最优”仍是当前网络，永远不切换。改为列表顺序绝对优先。
+                            if (s.BandPolicy == "Global")
+                            {
+                                s.BandPolicy = "Same";
+                                BandPolicyMigrated = true;
+                            }
                             s.SchemaVersion = CurrentSchema;
                         }
                         return s;

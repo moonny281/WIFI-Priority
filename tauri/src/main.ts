@@ -320,8 +320,8 @@ function bandHint(): string {
   const pref = settings.PreferBand === '2.4G' ? '2.4G' : '5G（含 6G）';
   const other = settings.PreferBand === '2.4G' ? '其它频段' : '2.4G ';
   if (settings.BandPolicy === 'Off') return '不区分频段：只按优先级列表顺序，同名的双频网络由 Windows 自己选频段。';
-  if (settings.BandPolicy === 'Same') return `仅同一网络内：先按列表顺序；同一个 WiFi 同时有多个频段时，优先连 ${pref}。`;
-  return `全局：只要有可用的 ${pref} 网络，就优先于所有${other}网络，再按列表顺序。例如列表里靠后的 5G 网络会排在靠前的 2.4G 网络前面。`;
+  if (settings.BandPolicy === 'Global') return `全局：只要有可用的 ${pref} 网络，就优先于所有${other}网络，再按列表顺序。例如列表里靠后的 5G 网络会排在靠前的 2.4G 网络前面——所以当前连着靠后的 5G 网络时，列表靠前的 2.4G 网络出现也不会切换过去。`;
+  return `仅同一网络内（推荐）：列表顺序绝对优先，更高优先级的网络出现就切换；同一个 WiFi 同时有多个频段时，优先连 ${pref}。`;
 }
 
 /** 把 settings 同步到所有带 data-setting 的控件上。 */

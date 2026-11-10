@@ -3,8 +3,12 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::atomic::AtomicBool;
 
-pub const CURRENT_SCHEMA: i64 = 2;
+pub const CURRENT_SCHEMA: i64 = 3;
+
+/// 启动时从旧配置迁移过“频段策略”（Global → Same）的标记，引擎启动后写一条日志告知用户。
+pub static BAND_POLICY_MIGRATED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "PascalCase", default)]
@@ -55,7 +59,7 @@ impl Default for Settings {
             takeover_unlisted: true,
             internet_check: false,
             notify: true,
-            band_policy: "Global".into(),
+            band_policy: "Same".into(),
             prefer_band: "5G".into(),
             theme: "System".into(),
             schema_version: 0, // 0 = 配置文件里没有这个字段（旧版本写的）
@@ -82,9 +86,18 @@ impl Settings {
     pub fn from_json(text: &str) -> Option<Settings> {
         let mut s: Settings = serde_json::from_str(text).ok()?;
         if s.schema_version < CURRENT_SCHEMA {
-            s.scan_interval_sec = 3;
-            s.confirm_ms = 400;
-            s.cooldown_sec = 8;
+            if s.schema_version < 2 {
+                // v1.1.1：毫秒级切换，旧版的 10 秒/2 次/60 秒默认值会拖慢切换
+                s.scan_interval_sec = 3;
+                s.confirm_ms = 400;
+                s.cooldown_sec = 8;
+            }
+            // v1.1.3：旧默认“全局偏好频段优先”会让当前的 5G 网络排到列表里更靠前的 2.4G 网络之前，
+            // 于是更高优先级的网络出现时“最优”仍是当前网络，永远不切换。改为列表顺序绝对优先。
+            if s.band_policy == "Global" {
+                s.band_policy = "Same".into();
+                BAND_POLICY_MIGRATED.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             s.schema_version = CURRENT_SCHEMA;
         }
         s.sanitize();
@@ -105,7 +118,7 @@ impl Settings {
         self.overlay_opacity = self.overlay_opacity.clamp(0.2, 1.0);
         self.overlay_scale = self.overlay_scale.clamp(0.7, 2.0);
         if !matches!(self.band_policy.as_str(), "Off" | "Same" | "Global") {
-            self.band_policy = "Global".into();
+            self.band_policy = "Same".into();
         }
         if !matches!(self.prefer_band.as_str(), "5G" | "2.4G") {
             self.prefer_band = "5G".into();

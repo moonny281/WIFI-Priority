@@ -126,6 +126,9 @@ impl<H: Host> Engine<H> {
         } else {
             self.log("无法打开原生 WLAN 接口，使用 netsh 兼容模式（切换较慢）");
         }
+        if BAND_POLICY_MIGRATED.load(std::sync::atomic::Ordering::SeqCst) {
+            self.log("v1.1.3：频段策略已由“全局偏好频段优先”改为“仅同一网络内”（列表顺序绝对优先）——旧策略会让当前的 5G 网络排在列表更靠前的 2.4G 网络之前，导致更高优先级的网络出现时不切换。想恢复可在 设置 → 频段偏好 里改回");
+        }
         self.spawn_internet_monitor();
 
         loop {

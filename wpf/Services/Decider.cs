@@ -54,6 +54,7 @@ namespace WifiPriority.Services
         int _prevSignal = 100;      // 上一次评估时当前网络的信号（判断“换网前原网络是不是已经很差”）
         long _pendingLastSeen;      // 候选最后一次被选为最优的时间（信号在阈值线上抖动时保留确认计时）
         long _lastDiagAt = Never;   // 上一次写“为什么没切”诊断日志的时间
+        long _lastOrderDiagAt = Never;  // 上一次写“被频段策略排在后面”诊断日志的时间
         readonly Dictionary<string, long> _bad = new Dictionary<string, long>();
 
         /// <summary>程序正在切换到的网络（连接请求已发出、结果还没落定），给悬浮框显示“正在切换到 …”。</summary>
@@ -199,7 +200,7 @@ namespace WifiPriority.Services
             if (st.Connecting || _lastPlan != null) return d;
 
             var pri = s.Priorities.ToList();
-            string policy = s.BandPolicy == "Off" || s.BandPolicy == "Same" ? s.BandPolicy : "Global";
+            string policy = s.BandPolicy == "Off" || s.BandPolicy == "Global" ? s.BandPolicy : "Same";
             bool prefer24 = s.PreferBand == "2.4G";
             var cands = BuildCands(st, pri, policy);
 
@@ -251,6 +252,26 @@ namespace WifiPriority.Services
                     _lastDiagAt = now;
                     d.Logs.Add($"优先网络 {Label(ordered[i].Ssid, ordered[i].Band)} 暂不切换：{why}");
                     break;
+                }
+            }
+
+            // 诊断：“全局偏好频段优先”把当前网络排在了列表里更靠前的网络之前（例如当前是 5G，更靠前的网络只有 2.4G），
+            // 这会让“出现更高优先级网络”永远不触发切换。这是策略的设计，但用户通常想不到，所以 5 分钟提示一次。
+            if (held && policy == "Global" && now - _lastOrderDiagAt > 300000)
+            {
+                int cp2 = ordered.FindIndex(IsCurrent);
+                if (cp2 >= 0)
+                {
+                    var curC = ordered[cp2];
+                    for (int j = cp2 + 1; j < ordered.Count; j++)
+                    {
+                        if (ordered[j].Rank < curC.Rank && Usable(ordered[j]))
+                        {
+                            _lastOrderDiagAt = now;
+                            d.Logs.Add($"优先网络 {Label(ordered[j].Ssid, ordered[j].Band)} 信号正常，但“全局偏好频段优先”把当前网络排在了它前面，所以没有切换；想让列表顺序绝对优先，请在 设置 → 频段偏好 选“仅同一网络内”");
+                            break;
+                        }
+                    }
                 }
             }
 

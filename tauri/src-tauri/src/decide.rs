@@ -68,6 +68,7 @@ pub struct Decider {
     prev_signal: i64,
     pending_last_seen: i64,
     last_diag_at: i64,
+    last_order_diag_at: i64,
     bad: BadMap,
 }
 
@@ -165,6 +166,7 @@ impl Decider {
             prev_signal: 100,
             pending_last_seen: 0,
             last_diag_at: NEVER,
+            last_order_diag_at: NEVER,
             bad: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -275,8 +277,8 @@ impl Decider {
         let pri: Vec<String> = s.priorities.clone();
         let policy: &str = match s.band_policy.as_str() {
             "Off" => "Off",
-            "Same" => "Same",
-            _ => "Global",
+            "Global" => "Global",
+            _ => "Same",
         };
         let prefer24 = s.prefer_band == "2.4G";
         let mut cands = build_cands(st, &pri, policy);
@@ -346,6 +348,22 @@ impl Decider {
             if let Some((lb, w)) = blocked {
                 self.last_diag_at = now;
                 d.logs.push(format!("优先网络 {} 暂不切换：{}", lb, w));
+            }
+        }
+
+        // 诊断：“全局偏好频段优先”把当前网络排在了列表里更靠前的网络之前（例如当前是 5G，更靠前的网络只有 2.4G），
+        // 这会让“出现更高优先级网络”永远不触发切换。这是策略的设计，但用户通常想不到，所以 5 分钟提示一次。
+        if held && policy == "Global" && now - self.last_order_diag_at > 300_000 {
+            if let Some(cur_c) = cands.iter().find(|c| is_current(c)) {
+                let cur_rank = cur_c.rank;
+                let cur_pos = cands.iter().position(|c| is_current(c)).unwrap_or(cands.len());
+                if let Some(c) = cands.iter().skip(cur_pos + 1).find(|c| c.rank < cur_rank && usable(c)) {
+                    self.last_order_diag_at = now;
+                    d.logs.push(format!(
+                        "优先网络 {} 信号正常，但“全局偏好频段优先”把当前网络排在了它前面，所以没有切换；想让列表顺序绝对优先，请在 设置 → 频段偏好 选“仅同一网络内”",
+                        label(&c.ssid, c.band)
+                    ));
+                }
             }
         }
 

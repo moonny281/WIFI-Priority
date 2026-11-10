@@ -249,6 +249,36 @@ fn t18_active_target_reports_pending_switch() {
 }
 
 #[test]
+fn t19_global_policy_blocks_upgrade_but_same_policy_switches() {
+    // 当前连着列表靠后的 5G 网络 B，列表靠前的 A 只有 2.4G：
+    // “全局偏好频段优先”下不会升级（而且会提示原因），“仅同一网络内”下立刻升级
+    let w = st(Some(("B", 5, 70)), &[("A", 2, 80), ("B", 5, 70)]);
+    let mut d = Decider::new();
+    let r = d.decide(&w, &cfg("Global", "5G", 0, &["A", "B"]), 1000, false);
+    assert!(r.connect.is_none());
+    assert!(r.logs.iter().any(|l| l.contains("全局偏好频段优先")));
+
+    let mut d = Decider::new();
+    let p = d.decide(&w, &cfg("Same", "5G", 0, &["A", "B"]), 1000, false).connect.expect("upgrade to A");
+    assert_eq!(p.ssid, "A");
+    assert!(p.reason.contains("更高优先级"));
+}
+
+#[test]
+fn s6_band_policy_migration_global_to_same() {
+    // 旧配置（schema 2）里的 Global → Same，同时不重置用户自己调过的扫描/确认/冷却参数
+    let s = Settings::from_json(r#"{"SchemaVersion":2,"BandPolicy":"Global","ScanIntervalSec":7,"ConfirmMs":900,"CooldownSec":20}"#).unwrap();
+    assert_eq!(s.band_policy, "Same");
+    assert_eq!((s.scan_interval_sec, s.confirm_ms, s.cooldown_sec), (7, 900, 20));
+    assert_eq!(s.schema_version, CURRENT_SCHEMA);
+    // 已是最新版本的配置：用户自己选的 Global 不会再被改
+    let s = Settings::from_json(r#"{"SchemaVersion":3,"BandPolicy":"Global"}"#).unwrap();
+    assert_eq!(s.band_policy, "Global");
+    // 全新安装默认 Same
+    assert_eq!(Settings::fresh().band_policy, "Same");
+}
+
+#[test]
 fn s5_overlay_layer_default_and_sanitize() {
     let mut s = Settings::fresh();
     assert_eq!(s.overlay_layer, "Top");
@@ -358,6 +388,6 @@ fn s4_sanitize() {
     s.up_threshold = 50; s.down_threshold = 80; s.band_policy = "x".into(); s.overlay_opacity = 5.0; s.scan_interval_sec = -3;
     s.sanitize();
     assert_eq!((s.up_threshold, s.down_threshold, s.scan_interval_sec), (50, 50, 0));
-    assert_eq!(s.band_policy, "Global");
+    assert_eq!(s.band_policy, "Same"); // 非法值回落到“仅同一网络内”（列表顺序绝对优先）
     assert_eq!(s.overlay_opacity, 1.0);
 }
