@@ -50,6 +50,7 @@ struct Cand {
     signal: i64,
     rank: usize,
     iface: i32,
+    seen_at: i64, // 最近一次被扫描到并更新的时间（-1 = 无法判断，0 = 从未观察到更新）
 }
 
 impl Cand {
@@ -72,6 +73,7 @@ pub struct Decider {
     last_order_diag_at: i64,
     disc_at: i64, // 本次“未连接”状态开始的时间（0 = 当前不是未连接）
     not_before: i64, // 系统直接拒绝连接请求后，至少隔 3 秒再试（防止每 250 ms 空转，不是网络冷却）
+    block_at: HashMap<String, i64>, // 连失败 / 非程序发起断开的网络 → 发生时间。之后必须被扫描到并更新过（有新证据）才允许再连
     skip_ssid: Option<String>, // 断网状态下刚连失败的网络：15 秒内先试下一个，别在断网时只盯着它死磕
     skip_until: i64,
     no_net: Arc<Mutex<Option<String>>>, // 当前连着、但检测不到互联网的 WiFi。离开它就清除，不留冷却
@@ -115,6 +117,7 @@ fn build_cands(st: &WifiState, pri: &[String], policy: &str, stale_filter: bool)
                 signal: if st.connected && n.ssid == st.ssid { st.signal } else { any.map(|b| b.signal).unwrap_or(n.signal) },
                 rank: i,
                 iface: any.map(|b| b.iface).unwrap_or(-1),
+                seen_at: any.map(|b| b.changed_at).unwrap_or(-1),
             });
             continue;
         }
@@ -132,6 +135,7 @@ fn build_cands(st: &WifiState, pri: &[String], policy: &str, stale_filter: bool)
                 signal: b.signal,
                 rank: i,
                 iface: b.iface,
+                seen_at: b.changed_at,
             });
         }
     }
@@ -181,6 +185,7 @@ impl Decider {
             last_order_diag_at: NEVER,
             disc_at: 0,
             not_before: 0,
+            block_at: HashMap::new(),
             skip_ssid: None,
             skip_until: 0,
             no_net: Arc::new(Mutex::new(None)),
@@ -223,6 +228,9 @@ impl Decider {
 
     pub fn decide(&mut self, st: &WifiState, s: &Settings, now: i64, paused_in: bool) -> Decision {
         let mut d = Decision::default();
+        if st.connected {
+            self.block_at.remove(&st.ssid); // 连上了，说明它在
+        }
         if st.connected || st.connecting {
             self.disc_at = 0;
         } else if self.disc_at == 0 {
@@ -276,7 +284,8 @@ impl Decider {
                 } else {
                     // 不做失败冷却：目标网络还在、还是最优，就会再次尝试。
                     // 唯一的例外：断网状态下，先让下一个候选试一次，别在断网时只盯着失败的那个死磕。
-                    d.logs.push(format!("连接 {} 没有成功，将再次尝试", lp.ssid));
+                    d.logs.push(format!("连接 {} 没有成功，等扫描确认它还在再重试", lp.ssid));
+                    self.block_at.insert(lp.ssid.clone(), now);
                     if !st.connected {
                         self.skip_ssid = Some(lp.ssid.clone());
                         self.skip_until = now + 15_000;
@@ -309,7 +318,12 @@ impl Decider {
             self.prev = Some(st.ssid.clone());
             self.prev_signal = st.signal;
         } else {
-            self.prev = None;
+            // 非程序发起的断开（热点被关、信号丢失）：缓存里它的条目还是旧的，必须等扫描证明它又出现了才重连
+            if let Some(p) = self.prev.take() {
+                if self.last_plan.is_none() {
+                    self.block_at.insert(p, now);
+                }
+            }
         }
 
         if st.location_denied || paused {
@@ -347,11 +361,27 @@ impl Decider {
                 None => false,
             }
         };
+        let block_at = self.block_at.clone();
+        let blocked = |c: &Cand| -> bool {
+            match block_at.get(&c.ssid) {
+                None => false,
+                Some(&b) => {
+                    if c.seen_at > 0 {
+                        c.seen_at <= b // 必须在失败/断开之后又被扫描到并更新过，才算还在
+                    } else if c.seen_at < 0 {
+                        now - b < 20_000 // 驱动没给时间戳，无法求证：退化为 20 秒间隔
+                    } else {
+                        true // 0 = 启动时缓存里的、从未观察到更新：不算证据
+                    }
+                }
+            }
+        };
         let skip: Option<String> = if !st.connected && now < self.skip_until { self.skip_ssid.clone() } else { None };
         let is_bad = |c: &Cand| -> bool {
             is_bad_key(&bad, &c.key(), now)
                 || no_net.as_deref() == Some(c.ssid.as_str())
                 || skip.as_deref() == Some(c.ssid.as_str())
+                || blocked(c)
         };
 
         let cur_signal: Option<i64> = cands.iter().filter(|c| is_current(c)).map(|c| c.signal).max();
@@ -390,7 +420,7 @@ impl Decider {
         if held && now - self.last_diag_at > 30_000 {
             let why = |c: &Cand| -> Option<String> {
                 if is_bad(c) {
-                    return Some("刚才没连上或无法上网，暂不选它".to_string());
+                    return Some("刚才连不上、断开或无法上网，等扫描确认它还在再重试".to_string());
                 }
                 let saved = !c.profile.is_empty()
                     && (st.profiles.contains(&c.profile) || st.profiles.contains(&c.ssid));

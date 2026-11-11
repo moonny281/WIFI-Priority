@@ -346,7 +346,11 @@ impl Client {
                             chan: 0,
                             rssi,
                             iface: i as i32,
-                            host_ts: rd_u64(p, base + 80),
+                            host_ts: {
+                                // 优先用 TSF（接入点自己的计时器，收到它的新帧才会变），没有再用 host timestamp
+                                let tsf = rd_u64(p, base + 72);
+                                if tsf != 0 { tsf } else { rd_u64(p, base + 80) }
+                            },
                             stale: false,
                         });
                     }

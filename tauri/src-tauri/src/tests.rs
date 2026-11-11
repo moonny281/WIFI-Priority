@@ -16,7 +16,7 @@ fn st(cur: Option<(&str, i32, i64)>, bss: &[(&str, i32, i64)]) -> WifiState {
                 s.nearby.len() - 1
             }
         };
-        s.nearby[idx].bss.push(BssInfo { bssid: format!("aa:bb:cc:dd:ee:{:02x}", k), band: *band, signal: *sig, ..Default::default() });
+        s.nearby[idx].bss.push(BssInfo { bssid: format!("aa:bb:cc:dd:ee:{:02x}", k), band: *band, signal: *sig, changed_at: i64::MAX / 2, ..Default::default() });
         k += 1;
     }
     for n in s.nearby.iter_mut() { summarize(n); }
@@ -336,11 +336,13 @@ fn f1_ghost_entry_is_flagged_after_scans() {
     let mut s = ghost_state(100);
     f.apply(&mut s, 100);
     assert!(s.nearby[0].bss[0].stale);
+    assert_eq!(s.nearby[0].bss[0].changed_at, 0);
     // 扫描完成，时间戳变了 → 确认在场
     f.scan_done(3000);
     let mut s = ghost_state(200);
     f.apply(&mut s, 3100);
     assert!(!s.nearby[0].bss[0].stale);
+    assert_eq!(s.nearby[0].bss[0].changed_at, 3100);
     // 热点关了：时间戳不再变化。再完成两次扫描 → 判为已消失
     f.scan_done(6000);
     f.scan_done(9000);
@@ -381,6 +383,7 @@ fn f3_current_bssid_and_missing_timestamp_are_never_stale() {
     let mut s = ghost_state(0); // 驱动没给时间戳
     f.apply(&mut s, 200);
     assert!(!s.nearby[0].bss[0].stale);
+    assert_eq!(s.nearby[0].bss[0].changed_at, -1);
 }
 
 #[test]
@@ -395,6 +398,49 @@ fn t24_offline_failure_tries_next_candidate_instead_of_hammering() {
     let r = d.decide(&off, &s, 6500, false); // 4 秒还是没连上（仍未连接）
     assert!(r.logs.iter().any(|l| l.contains("没有成功")));
     assert_eq!(r.connect.map(|p| p.ssid), Some("Home".to_string()));
+}
+
+#[test]
+fn t25_unplanned_disconnect_requires_fresh_evidence_before_reconnect() {
+    // 连着热点时热点被关掉：断开后缓存里还留着它的旧条目（信号还是 80，时间戳不再更新）。
+    // 不能立刻去重连它，要先连第二优先级；等扫描证明热点又出现了（条目更新了）才允许再连。
+    let mut d = Decider::new();
+    let s = cfg("Same", "5G", 0, &["Hotspot", "Home"]);
+    let on = st(Some(("Hotspot", 2, 80)), &[("Hotspot", 2, 80), ("Home", 2, 70)]);
+    assert!(d.decide(&on, &s, 500, false).connect.is_none());
+    let mut off = st(None, &[("Hotspot", 2, 80), ("Home", 2, 70)]);
+    set_changed(&mut off, "Hotspot", 500); // 热点最后一次更新是断开之前
+    assert!(d.decide(&off, &s, 1000, false).connect.is_none()); // 刚断开，先等 1.2 秒
+    let p = d.decide(&off, &s, 2300, false).connect.expect("fall to Home");
+    assert_eq!(p.ssid, "Home");
+    // 连上 Home 之后，热点还是只有旧条目：不理它
+    let mut on_home = st(Some(("Home", 2, 70)), &[("Hotspot", 2, 80), ("Home", 2, 70)]);
+    set_changed(&mut on_home, "Hotspot", 500);
+    assert!(d.decide(&on_home, &s, 2600, false).connect.is_none());
+    // 热点其实又开了：被扫描到、条目更新（时间在断开之后）→ 证据到了，立即升级
+    set_changed(&mut on_home, "Hotspot", 3000);
+    assert_eq!(d.decide(&on_home, &s, 2800, false).connect.map(|p| p.ssid), Some("Hotspot".to_string()));
+}
+
+#[test]
+fn t26_failed_attempt_is_not_retried_without_new_evidence() {
+    // 升级到热点失败（热点其实已经不在）：回到原网络后，不再反复折腾，直到热点又被扫描到
+    let mut d = Decider::new();
+    let s = cfg("Same", "5G", 0, &["Hotspot", "Home"]);
+    let mut w = st(Some(("Home", 2, 70)), &[("Hotspot", 2, 80), ("Home", 2, 70)]);
+    set_changed(&mut w, "Hotspot", 900);
+    let p = d.decide(&w, &s, 1000, false).connect.expect("try hotspot");
+    assert_eq!(p.ssid, "Hotspot");
+    // 4 秒后还连着 Home（没连上热点）→ 记失败，之后不再重试
+    let r = d.decide(&w, &s, 5200, false);
+    assert!(r.logs.iter().any(|l| l.contains("没有成功")));
+    assert!(r.connect.is_none());
+    for t in [6000, 9500, 20_000, 60_000] {
+        assert!(d.decide(&w, &s, t, false).connect.is_none(), "t={}", t);
+    }
+    // 热点又被扫描到（条目在失败之后更新过）→ 允许再试
+    set_changed(&mut w, "Hotspot", 61_000);
+    assert_eq!(d.decide(&w, &s, 62_000, false).connect.map(|p| p.ssid), Some("Hotspot".to_string()));
 }
 
 #[test]
@@ -459,6 +505,12 @@ fn s5_overlay_layer_default_and_sanitize() {
     // 旧配置文件没有这个字段 → 取默认值
     let old = Settings::from_json(r#"{"SchemaVersion":2,"Priorities":["Home"]}"#).unwrap();
     assert_eq!(old.overlay_layer, "Top");
+}
+
+fn set_changed(w: &mut WifiState, ssid: &str, at: i64) {
+    for b in w.nearby.iter_mut().find(|n| n.ssid == ssid).unwrap().bss.iter_mut() {
+        b.changed_at = at;
+    }
 }
 
 fn ghost_state(ts: u64) -> WifiState {

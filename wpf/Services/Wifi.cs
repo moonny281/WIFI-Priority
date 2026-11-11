@@ -21,6 +21,7 @@ namespace WifiPriority.Services
         public int Rssi;     // dBm（原生读取时才有）
         public int Iface;    // 来自第几块无线网卡
         public ulong HostTs; // WLAN_BSS_ENTRY.ullHostTimestamp：收到这个接入点最近一帧的时间戳（0 = 驱动没给）
+        public long ChangedAt; // 我们观察到该接入点时间戳最近一次变化的时间（引擎时钟 ms）；-1 = 无法判断（驱动没给时间戳）；0 = 启动时缓存里的、从未观察到变化
         public bool Stale;   // true = 缓存里的“幽灵”条目（接入点其实已经不在了），由 BssFreshness 标记
     }
 

@@ -51,7 +51,7 @@ namespace WifiPriority.Services
                         b.Stale = false;
                         if (string.IsNullOrEmpty(b.Bssid)) continue;
                         seen.Add(b.Bssid);
-                        if (b.HostTs == 0) continue;                      // 驱动没给时间戳：无法判断，按“在”处理
+                        if (b.HostTs == 0) { b.ChangedAt = -1; continue; }   // 驱动没给时间戳：无法判断，按“在”处理
 
                         Rec r;
                         if (!_ts.TryGetValue(b.Bssid, out r))
@@ -62,7 +62,8 @@ namespace WifiPriority.Services
                         }
                         else if (r.Ts != b.HostTs) { r.Ts = b.HostTs; r.ChangedAt = now; }
 
-                        if (st.CurBssid != null && string.Equals(st.CurBssid, b.Bssid, StringComparison.OrdinalIgnoreCase)) continue;
+                        if (st.CurBssid != null && string.Equals(st.CurBssid, b.Bssid, StringComparison.OrdinalIgnoreCase)) { b.ChangedAt = now; continue; }   // 当前连着的接入点一定在
+                        b.ChangedAt = r.ChangedAt;
                         b.Stale = IsStale(r.ChangedAt, now);
                     }
                 }

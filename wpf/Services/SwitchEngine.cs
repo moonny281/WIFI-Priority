@@ -111,7 +111,7 @@ namespace WifiPriority.Services
             if (now - _lastScanAt < gap) return;
             // 正在连接时不扫描：用户在 Windows 里手动连、或我们自己刚发出的连接请求。
             // 有些网卡驱动在关联过程中被扫描打断会直接报“无法连接网络”（手机热点响应慢，更容易中招）。
-            if (_connectingSeenAt != 0 && now - _connectingSeenAt < 4000) return;
+            if (_connectingSeenAt != 0 && now - _connectingSeenAt < 2000) return;
             if (_dec.ActiveTarget != null) return;
             if (_scanBusy && now - _lastScanAt < 6000) return;      // 上一次扫描还没完成
             _lastScanAt = now;

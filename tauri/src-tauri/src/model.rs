@@ -161,6 +161,8 @@ pub struct BssInfo {
     #[serde(skip)]
     pub host_ts: u64, // WLAN_BSS_ENTRY.ullHostTimestamp：收到这个接入点最近一帧的时间戳（0 = 驱动没给）
     #[serde(skip)]
+    pub changed_at: i64, // 我们观察到该接入点时间戳最近一次变化的时间（引擎时钟 ms）；-1 = 无法判断（驱动没给时间戳）；0 = 启动时缓存里的、从未观察到变化
+    #[serde(skip)]
     pub stale: bool, // true = 缓存里的“幽灵”条目（接入点其实已经不在了），由 Freshness 标记
 }
 

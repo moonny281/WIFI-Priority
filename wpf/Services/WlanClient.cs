@@ -114,6 +114,12 @@ namespace WifiPriority.Services
 
         /// <summary>请求所有网卡立即扫描（异步，完成时会收到 Notified(7)）。</summary>
         /// <summary>返回 true = 至少有一块网卡接受了扫描请求（之后会收到通知 7/8）；false = 不会有通知，调用方不要空等。</summary>
+        static ulong TsOf(IntPtr e)
+        {
+            ulong tsf = unchecked((ulong)Marshal.ReadInt64(e, 72));
+            return tsf != 0 ? tsf : unchecked((ulong)Marshal.ReadInt64(e, 80));
+        }
+
         public bool Scan()
         {
             if (_h == IntPtr.Zero) return false;
@@ -295,7 +301,8 @@ namespace WifiPriority.Services
                                 net.Bss.Add(new BssInfo
                                 {
                                     Bssid = ReadMac(e, 40),
-                                    HostTs = unchecked((ulong)Marshal.ReadInt64(e, 80)),
+                                    // 优先用 TSF（接入点自己的计时器，收到它的新帧才会变），没有再用 host timestamp
+                                    HostTs = TsOf(e),
                                     Signal = (int)lq,
                                     Rssi = rssi,
                                     Band = BandFromKhz(khz),

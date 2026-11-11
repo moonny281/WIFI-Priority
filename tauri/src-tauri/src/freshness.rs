@@ -47,7 +47,8 @@ impl Freshness {
                 let key = b.bssid.to_ascii_lowercase();
                 seen.insert(key.clone());
                 if b.host_ts == 0 {
-                    continue; // 驱动没给时间戳：无法判断，按“在”处理
+                    b.changed_at = -1; // 驱动没给时间戳：无法判断，按“在”处理
+                    continue;
                 }
                 let startup = self.done.is_empty() && now - self.start_at < 5000;
                 let e = self.ts.entry(key.clone()).or_insert((b.host_ts, if startup { 0 } else { now }));
@@ -56,8 +57,10 @@ impl Freshness {
                 }
                 let changed = e.1;
                 if cur.as_deref() == Some(key.as_str()) {
-                    continue; // 当前连着的接入点一定在
+                    b.changed_at = now; // 当前连着的接入点一定在
+                    continue;
                 }
+                b.changed_at = changed;
                 b.stale = self.is_stale(changed, now);
             }
         }

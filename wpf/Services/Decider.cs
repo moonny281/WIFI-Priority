@@ -38,6 +38,7 @@ namespace WifiPriority.Services
         {
             public string Ssid, Bssid, Profile;
             public int Band, Signal, Rank, Iface;
+            public long SeenAt;   // 最近一次被扫描到并更新的时间（-1 = 无法判断，0 = 从未观察到更新）
             public string Key => Ssid + "|" + Band;
         }
 
@@ -60,6 +61,8 @@ namespace WifiPriority.Services
         readonly Dictionary<string, long> _bad = new Dictionary<string, long>();   // 仅用于“指定频段失败”（频段级，不是网络级）
         volatile string _noNet;     // 当前连着、但检测不到互联网的 WiFi。一旦离开它就清除，不留冷却
         long _notBefore;            // 系统直接拒绝连接请求后，至少隔 3 秒再试（防止每 250 ms 空转，不是网络冷却）
+        // 连失败 / 非程序发起断开的网络 → 发生时间。之后必须被扫描到并更新过（有新证据）才允许再连
+        readonly Dictionary<string, long> _blockAt = new Dictionary<string, long>();
         string _skipSsid;           // 断网状态下刚连失败的网络：15 秒内先试下一个，别在断网时只盯着它死磕（连上任何网络后失效）
         long _skipUntil;
 
@@ -111,7 +114,8 @@ namespace WifiPriority.Services
                     {
                         Ssid = n.Ssid, Band = 0, Bssid = null, Rank = i, Profile = n.Profile ?? n.Ssid,
                         Iface = any != null ? any.Iface : -1,
-                        Signal = st.Connected && n.Ssid == st.Ssid ? st.Signal : (any != null ? any.Signal : n.Signal)
+                        Signal = st.Connected && n.Ssid == st.Ssid ? st.Signal : (any != null ? any.Signal : n.Signal),
+                        SeenAt = any != null ? any.ChangedAt : -1
                     });
                     continue;
                 }
@@ -122,7 +126,7 @@ namespace WifiPriority.Services
                     list.Add(new Cand
                     {
                         Ssid = n.Ssid, Band = b.Band, Bssid = b.Bssid, Signal = b.Signal, Rank = i,
-                        Iface = b.Iface, Profile = n.Profile ?? n.Ssid
+                        Iface = b.Iface, Profile = n.Profile ?? n.Ssid, SeenAt = b.ChangedAt
                     });
                 }
             }
@@ -145,6 +149,7 @@ namespace WifiPriority.Services
             var d = new Decision();
             if (st.Connected || st.Connecting) _discAt = 0;
             else if (_discAt == 0) _discAt = now;
+            if (st.Connected) _blockAt.Remove(st.Ssid);   // 连上了，说明它在
             if (_noNet != null && (!st.Connected || st.Ssid != _noNet)) _noNet = null;   // 离开了那个无网络的 WiFi，不留记忆
             string cur = st.Connected ? st.Ssid : null;
 
@@ -186,7 +191,8 @@ namespace WifiPriority.Services
                     {
                         // 不做失败冷却：目标网络还在、还是最优，就会再次尝试。
                         // 唯一的例外：断网状态下，先让下一个候选试一次，别在断网时只盯着失败的那个死磕。
-                        d.Logs.Add($"连接 {_lastPlan.Ssid} 没有成功，将再次尝试");
+                        d.Logs.Add($"连接 {_lastPlan.Ssid} 没有成功，等扫描确认它还在再重试");
+                        _blockAt[_lastPlan.Ssid] = now;
                         if (cur == null) { _skipSsid = _lastPlan.Ssid; _skipUntil = now + 15000; }
                     }
                     _lastPlan = null;
@@ -212,7 +218,12 @@ namespace WifiPriority.Services
                 _prev = st.Ssid;
                 _prevSignal = st.Signal;
             }
-            else _prev = null;
+            else
+            {
+                // 非程序发起的断开（热点被关、信号丢失）：缓存里它的条目还是旧的，必须等扫描证明它又出现了才重连
+                if (_prev != null && _lastPlan == null) _blockAt[_prev] = now;
+                _prev = null;
+            }
 
             if (st.LocationDenied || paused) { ResetPending(); return d; }
 
@@ -232,7 +243,15 @@ namespace WifiPriority.Services
             bool IsCurrent(Cand c) =>
                 cur != null && c.Ssid == cur && (policy == "Off" || st.CurBand == 0 || c.Band == st.CurBand);
 
-            bool IsBad(Cand c) => IsBadKey(c.Key, now) || (_noNet != null && c.Ssid == _noNet)
+            bool Blocked(Cand c)
+            {
+                long blockedAt;
+                if (!_blockAt.TryGetValue(c.Ssid, out blockedAt)) return false;
+                if (c.SeenAt > 0) return c.SeenAt <= blockedAt;      // 必须在失败/断开之后又被扫描到并更新过，才算还在
+                if (c.SeenAt < 0) return now - blockedAt < 20000;    // 驱动没给时间戳，无法求证：退化为 20 秒间隔
+                return true;                                 // 0 = 启动时缓存里的、从未观察到更新：不算证据
+            }
+            bool IsBad(Cand c) => IsBadKey(c.Key, now) || (_noNet != null && c.Ssid == _noNet) || Blocked(c)
                 || (cur == null && _skipSsid != null && c.Ssid == _skipSsid && now < _skipUntil);
 
             var curCand = cands.Where(IsCurrent).OrderByDescending(c => c.Signal).FirstOrDefault();
@@ -255,7 +274,7 @@ namespace WifiPriority.Services
 
             string WhyNot(Cand c)
             {
-                if (IsBad(c)) return "刚才没连上或无法上网，暂不选它";
+                if (IsBad(c)) return "刚才连不上、断开或无法上网，等扫描确认它还在再重试";
                 bool saved = !string.IsNullOrEmpty(c.Profile) && (st.Profiles.Contains(c.Profile) || st.Profiles.Contains(c.Ssid));
                 if (!saved && !IsCurrent(c)) return "没有已保存的配置文件";
                 int th = relaxed ? s.DownThreshold : s.UpThreshold;
