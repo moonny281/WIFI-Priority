@@ -32,6 +32,7 @@ namespace WifiPriority.Services
         string _lastSig = "";
         long _lastPublishAt;
         volatile string _curSsid;
+        long _connectingSeenAt;   // 最近一次看到“正在连接”的时间
 
         public volatile bool ManualPause;
         public bool Paused => ManualPause || DateTime.Now < _pausedUntil;
@@ -104,6 +105,10 @@ namespace WifiPriority.Services
         {
             long gap = _s.ScanIntervalSec <= 0 ? 400 : _s.ScanIntervalSec * 1000L;
             if (now - _lastScanAt < gap) return;
+            // 正在连接时不扫描：用户在 Windows 里手动连、或我们自己刚发出的连接请求。
+            // 有些网卡驱动在关联过程中被扫描打断会直接报“无法连接网络”（手机热点响应慢，更容易中招）。
+            if (_connectingSeenAt != 0 && now - _connectingSeenAt < 4000) return;
+            if (_dec.ActiveTarget != null) return;
             if (_scanBusy && now - _lastScanAt < 6000) return;      // 上一次扫描还没完成
             _lastScanAt = now;
             bool ok = _wlan.Scan();
@@ -163,6 +168,7 @@ namespace WifiPriority.Services
 
             EnsureCurrent(st);
             _curSsid = st.Connected ? st.Ssid : null;
+            if (st.Connecting) _connectingSeenAt = Now;
 
             var dec = _dec.Decide(st, _s, Now, Paused);
             foreach (var l in dec.Logs) Log?.Invoke(l);

@@ -55,6 +55,8 @@ namespace WifiPriority.Services
         long _pendingLastSeen;      // 候选最后一次被选为最优的时间（信号在阈值线上抖动时保留确认计时）
         long _lastDiagAt = Never;   // 上一次写“为什么没切”诊断日志的时间
         long _lastOrderDiagAt = Never;  // 上一次写“被频段策略排在后面”诊断日志的时间
+        long _discAt;               // 本次“未连接”状态开始的时间（0 = 当前不是未连接）
+        const long DiscGraceMs = 1200;  // 刚断开的短暂窗口：用户在 Windows 里手动换网会先断开再开始连接，别抢着发起自己的连接
         readonly Dictionary<string, long> _bad = new Dictionary<string, long>();
 
         /// <summary>程序正在切换到的网络（连接请求已发出、结果还没落定），给悬浮框显示“正在切换到 …”。</summary>
@@ -128,6 +130,8 @@ namespace WifiPriority.Services
         public Decision Decide(WifiState st, AppSettings s, long now, bool paused)
         {
             var d = new Decision();
+            if (st.Connected || st.Connecting) _discAt = 0;
+            else if (_discAt == 0) _discAt = now;
             string cur = st.Connected ? st.Ssid : null;
 
             // 1) 上一次连接请求的结果（不阻塞：每次评估时顺带检查）
@@ -198,6 +202,10 @@ namespace WifiPriority.Services
 
             // 3) 连接请求还在进行中：不打断
             if (st.Connecting || _lastPlan != null) return d;
+
+            // 刚断开（<1.2 秒）：可能是用户在 Windows 里手动换网（先断开再开始连接），也可能是系统自己在重连。
+            // 这时抢着发起连接会把对方的连接打断，表现为“无法连接网络”。先等一下，看对方是否开始连接。
+            if (!st.Connected && now - _discAt < DiscGraceMs) return d;
 
             var pri = s.Priorities.ToList();
             string policy = s.BandPolicy == "Off" || s.BandPolicy == "Global" ? s.BandPolicy : "Same";
@@ -302,10 +310,15 @@ namespace WifiPriority.Services
             }
 
             string fromLabel = cur == null ? null : Label(cur, st.CurBand);
+
+            // 只有“同一个 WiFi 有多个频段、需要在频段之间选”时才指定接入点（BSSID）。
+            // 换到另一个 WiFi 时不指定：BSS 列表是缓存，手机热点的接入点地址经常变化，指定缓存里的旧地址会连不上。
+            bool multiBand = cands.Where(c => c.Ssid == best.Ssid && c.Band > 0).Select(c => c.Band).Distinct().Count() > 1;
+            bool pin = policy != "Off" && best.Band > 0 && multiBand && (cur == null || cur == best.Ssid);
             var plan = new Plan
             {
-                Ssid = best.Ssid, Band = best.Band, Iface = best.Iface, Profile = best.Profile,
-                Bssid = policy != "Off" && best.Band > 0 ? best.Bssid : null,
+                Ssid = best.Ssid, Band = pin ? best.Band : 0, Iface = best.Iface, Profile = best.Profile,
+                Bssid = pin ? best.Bssid : null,
                 Reason = reason, FromLabel = fromLabel, ToLabel = Label(best.Ssid, best.Band)
             };
             ResetPending();

@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 const NEVER: i64 = i64::MIN / 4;
 const SETTLE_MS: i64 = 4000; // 发出连接请求后，最多等这么久看结果
+const DISC_GRACE_MS: i64 = 1200; // 刚断开的短暂窗口：别抢着打断用户手动发起的连接
 
 #[derive(Clone, Debug)]
 pub struct Plan {
@@ -69,6 +70,7 @@ pub struct Decider {
     pending_last_seen: i64,
     last_diag_at: i64,
     last_order_diag_at: i64,
+    disc_at: i64, // 本次“未连接”状态开始的时间（0 = 当前不是未连接）
     bad: BadMap,
 }
 
@@ -167,6 +169,7 @@ impl Decider {
             pending_last_seen: 0,
             last_diag_at: NEVER,
             last_order_diag_at: NEVER,
+            disc_at: 0,
             bad: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -197,6 +200,11 @@ impl Decider {
 
     pub fn decide(&mut self, st: &WifiState, s: &Settings, now: i64, paused_in: bool) -> Decision {
         let mut d = Decision::default();
+        if st.connected || st.connecting {
+            self.disc_at = 0;
+        } else if self.disc_at == 0 {
+            self.disc_at = now;
+        }
         let mut paused = paused_in;
         let cur: Option<&str> = if st.connected { Some(st.ssid.as_str()) } else { None };
 
@@ -271,6 +279,12 @@ impl Decider {
 
         // 3) 连接请求还在进行中：不打断
         if st.connecting || self.last_plan.is_some() {
+            return d;
+        }
+
+        // 刚断开（<1.2 秒）：可能是用户在 Windows 里手动换网（先断开再开始连接），也可能是系统自己在重连。
+        // 这时抢着发起连接会把对方的连接打断，表现为“无法连接网络”。先等一下，看对方是否开始连接。
+        if !st.connected && now - self.disc_at < DISC_GRACE_MS {
             return d;
         }
 
@@ -416,12 +430,18 @@ impl Decider {
             }
         }
 
+        // 只有“同一个 WiFi 有多个频段、需要在频段之间选”时才指定接入点（BSSID）。
+        // 换到另一个 WiFi 时不指定：BSS 列表是缓存，手机热点的接入点地址经常变化，指定缓存里的旧地址会连不上。
+        let mut bands: Vec<i32> = cands.iter().filter(|c| c.ssid == best.ssid && c.band > 0).map(|c| c.band).collect();
+        bands.sort();
+        bands.dedup();
+        let pin = policy != "Off" && best.band > 0 && bands.len() > 1 && (cur.is_none() || cur == Some(best.ssid.as_str()));
         let plan = Plan {
             ssid: best.ssid.clone(),
-            band: best.band,
+            band: if pin { best.band } else { 0 },
             iface: best.iface,
             profile: best.profile.clone(),
-            bssid: if policy != "Off" && best.band > 0 { best.bssid.clone() } else { None },
+            bssid: if pin { best.bssid.clone() } else { None },
             reason,
             from_label: cur.map(|c| label(c, st.cur_band)),
             to_label: label(&best.ssid, best.band),

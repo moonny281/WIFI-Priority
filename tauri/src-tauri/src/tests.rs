@@ -69,7 +69,9 @@ fn t2_disconnected_connects_immediately_with_relaxed_threshold() {
     let mut d = Decider::new();
     let s = cfg("Global", "5G", 400, &["Home"]);
     let w = st(None, &[("Home", 2, 45), ("Home", 5, 42)]);
-    let p = d.decide(&w, &s, 1000, false).connect.expect("connect");
+    // v1.1.3：刚断开的 1.2 秒内先等一下（可能是用户在手动换网），之后才发起连接
+    assert!(d.decide(&w, &s, 1000, false).connect.is_none());
+    let p = d.decide(&w, &s, 2300, false).connect.expect("connect");
     assert_eq!(p.band, 5);
     assert!(p.from_label.is_none());
 }
@@ -115,18 +117,42 @@ fn t7_no_duplicate_requests_and_failure_marks_bad() {
     let mut d = Decider::new();
     let s = cfg("Global", "5G", 0, &["A", "B"]);
     let w = st(Some(("B", 2, 70)), &[("A", 2, 80), ("B", 2, 70)]);
-    assert_eq!(d.decide(&w, &s, 1000, false).connect.map(|p| p.ssid), Some("A".to_string()));
+    // v1.1.3：换到另一个 WiFi 时不指定接入点（BSSID）——缓存里的接入点地址可能已经变了（手机热点常见）
+    let p = d.decide(&w, &s, 1000, false).connect.expect("switch to A");
+    assert_eq!((p.ssid.as_str(), p.bssid.is_none(), p.band), ("A", true, 0));
     assert!(d.decide(&w, &s, 1300, false).connect.is_none());
-    // v1.1.2：指定接入点（BSSID）的连接 4 秒没落定 → 先改为不指定接入点重试一次，而不是直接拉黑
     let r = d.decide(&w, &s, 5200, false);
-    let retry = r.connect.expect("retry without bssid");
-    assert_eq!((retry.ssid.as_str(), retry.bssid.is_none(), retry.retried), ("A", true, true));
-    assert!(d.decide(&w, &s, 5300, false).connect.is_none());
-    // 重试也没成功 → 才拉黑
-    let r = d.decide(&w, &s, 9300, false);
     assert!(r.connect.is_none());
     assert!(r.logs.iter().any(|l| l.contains("没有成功")));
-    assert!(d.decide(&w, &s, 10000, false).connect.is_none());
+    assert!(d.decide(&w, &s, 6000, false).connect.is_none());
+}
+
+#[test]
+fn t7b_pinned_bssid_failure_retries_without_bssid() {
+    // 同一个 WiFi 在 2.4G/5G 之间选频段时才指定接入点；没连上 → 先不指定接入点重试一次
+    let mut d = Decider::new();
+    let s = cfg("Global", "5G", 0, &["Home"]);
+    let w = st(Some(("Home", 2, 70)), &[("Home", 2, 70), ("Home", 5, 80)]);
+    let p = d.decide(&w, &s, 1000, false).connect.expect("band up");
+    assert_eq!((p.band, p.bssid.is_some()), (5, true));
+    let dead = st(None, &[("Home", 2, 70), ("Home", 5, 80)]); // 连接掉了
+    assert!(d.decide(&dead, &s, 1300, false).connect.is_none());
+    let retry = d.decide(&dead, &s, 5200, false).connect.expect("retry without bssid");
+    assert_eq!((retry.ssid.as_str(), retry.bssid.is_none(), retry.retried), ("Home", true, true));
+}
+
+#[test]
+fn t20_waits_after_disconnect_before_taking_over() {
+    // 用户在 Windows 里手动换网：先断开（<1.2 秒内不抢着连），随后进入“正在连接”也不打断
+    let mut d = Decider::new();
+    let s = cfg("Global", "5G", 0, &["A", "B"]);
+    let off = st(None, &[("A", 2, 80), ("B", 2, 70)]);
+    assert!(d.decide(&off, &s, 1000, false).connect.is_none());
+    assert!(d.decide(&off, &s, 1100, false).connect.is_none());
+    let mut conn = st(None, &[("A", 2, 80), ("B", 2, 70)]);
+    conn.connecting = true;
+    assert!(d.decide(&conn, &s, 1500, false).connect.is_none());
+    assert!(d.decide(&conn, &s, 5000, false).connect.is_none());
 }
 
 #[test]
@@ -206,11 +232,13 @@ fn t15_first_connect_does_not_start_upgrade_cooldown() {
     // 从未连接状态连上（不算“升级”），紧接着出现更高优先级网络，不应被 8 秒冷却拦住
     let mut d = Decider::new();
     let s = cfg("Global", "5G", 0, &["A", "B"]);
-    let p = d.decide(&st(None, &[("B", 2, 70)]), &s, 1000, false).connect.expect("connect B");
+    let off = st(None, &[("B", 2, 70)]);
+    assert!(d.decide(&off, &s, 1000, false).connect.is_none()); // 刚断开，先等 1.2 秒
+    let p = d.decide(&off, &s, 2300, false).connect.expect("connect B");
     assert_eq!(p.ssid, "B");
-    d.connect_result(&p, true, 1000);
+    d.connect_result(&p, true, 2300);
     let w = st(Some(("B", 2, 70)), &[("A", 2, 80), ("B", 2, 70)]);
-    assert_eq!(d.decide(&w, &s, 1300, false).connect.map(|p| p.ssid), Some("A".to_string()));
+    assert_eq!(d.decide(&w, &s, 2600, false).connect.map(|p| p.ssid), Some("A".to_string()));
 }
 
 #[test]
