@@ -341,7 +341,7 @@
 
                             <CheckBox x:Name="SwTakeover" Content="当前连接的网络不在优先级列表里时，也自动切到列表中的网络"
                                       Style="{StaticResource Switch}" Margin="0,16,0,0" Click="Settings_Changed"/>
-                            <CheckBox x:Name="SwInternet" Content="联网检测：连上但无法上网时，视为不可用并回落"
+                            <CheckBox x:Name="SwInternet" Content="联网检测：连上 12 秒后仍连续检测不到互联网时，回落到下一个网络"
                                       Style="{StaticResource Switch}" Margin="0,12,0,0" Click="Settings_Changed"/>
                             <CheckBox x:Name="SwNotify" Content="切换时弹出系统通知"
                                       Style="{StaticResource Switch}" Margin="0,12,0,0" Click="Settings_Changed"/>

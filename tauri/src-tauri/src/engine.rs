@@ -288,35 +288,62 @@ impl<H: Host> Engine<H> {
     }
 
     // ---------- 联网检测（独立后台线程，不阻塞切换） ----------
+    // 只用来决定“刚连上的网络能不能上网，不能就回退”。不做任何冷却：离开那个网络后不留记忆，
+    // 它还在、还是最优，就会再次连接。
     fn spawn_internet_monitor(&self) {
-        let bad = self.dec.bad_handle();
+        let no_net = self.dec.no_net_handle();
         let cur = self.cur_ssid.clone();
         let sh = self.sh.clone();
         let host = self.host.clone();
         let _ = std::thread::Builder::new().name("wifi-ping".into()).spawn(move || {
             let mut fail = 0;
+            let mut last: Option<String> = None;
+            let mut since = now_ms();
             loop {
-                std::thread::sleep(Duration::from_secs(4));
+                std::thread::sleep(Duration::from_secs(3));
                 let enabled = sh.settings.lock().map(|s| s.internet_check).unwrap_or(false);
                 let ssid = cur.lock().ok().and_then(|g| g.clone());
                 let ssid = match (enabled, ssid) {
                     (true, Some(s)) => s,
                     _ => {
                         fail = 0;
+                        last = None;
                         continue;
                     }
                 };
+                // 刚连上（DHCP 还没完成、路由还没通）的 12 秒内不检测，避免把正在握手的热点误判成“无法上网”
+                if last.as_deref() != Some(ssid.as_str()) {
+                    last = Some(ssid.clone());
+                    since = now_ms();
+                    fail = 0;
+                    continue;
+                }
+                if now_ms() - since < 12_000 {
+                    continue;
+                }
                 if netsh::has_internet() {
                     fail = 0;
+                    if let Ok(mut g) = no_net.lock() {
+                        if g.as_deref() == Some(ssid.as_str()) {
+                            *g = None;
+                        }
+                    }
                 } else {
                     fail += 1;
-                    if fail >= 2 {
+                    if fail >= 3 {
+                        // 连续 3 次（约 9 秒）都不通才回退
                         fail = 0;
-                        if let Ok(mut b) = bad.lock() {
-                            b.insert(ssid.clone(), now_ms() + 300_000);
+                        let mut newly = false;
+                        if let Ok(mut g) = no_net.lock() {
+                            if g.as_deref() != Some(ssid.as_str()) {
+                                *g = Some(ssid.clone());
+                                newly = true;
+                            }
                         }
-                        log_line(&host, &sh, &format!("{} 已连接但无法上网，5 分钟内视为不可用", ssid));
-                        sh.wake();
+                        if newly {
+                            log_line(&host, &sh, &format!("{} 已连接但无法上网，回退到下一个可用网络", ssid));
+                            sh.wake();
+                        }
                     }
                 }
             }

@@ -113,18 +113,20 @@ fn t6_up_threshold() {
 }
 
 #[test]
-fn t7_no_duplicate_requests_and_failure_marks_bad() {
+fn t7_no_duplicate_requests_and_no_failure_cooldown() {
     let mut d = Decider::new();
     let s = cfg("Global", "5G", 0, &["A", "B"]);
     let w = st(Some(("B", 2, 70)), &[("A", 2, 80), ("B", 2, 70)]);
-    // v1.1.3：换到另一个 WiFi 时不指定接入点（BSSID）——缓存里的接入点地址可能已经变了（手机热点常见）
+    // 换到另一个 WiFi 时不指定接入点（BSSID）——缓存里的接入点地址可能已经变了（手机热点常见）
     let p = d.decide(&w, &s, 1000, false).connect.expect("switch to A");
     assert_eq!((p.ssid.as_str(), p.bssid.is_none(), p.band), ("A", true, 0));
-    assert!(d.decide(&w, &s, 1300, false).connect.is_none());
-    let r = d.decide(&w, &s, 5200, false);
+    assert!(d.decide(&w, &s, 1300, false).connect.is_none()); // 请求在途，不重复发
+    let r = d.decide(&w, &s, 5200, false); // 4 秒没落定 → 记录失败
     assert!(r.connect.is_none());
     assert!(r.logs.iter().any(|l| l.contains("没有成功")));
+    // v1.1.5：没有失败冷却，只受升级冷却（默认 8 秒，从上次发起切换算起）约束，冷却一过就再次尝试
     assert!(d.decide(&w, &s, 6000, false).connect.is_none());
+    assert_eq!(d.decide(&w, &s, 9500, false).connect.map(|p| p.ssid), Some("A".to_string()));
 }
 
 #[test]
@@ -255,15 +257,32 @@ fn t16_blocked_by_threshold_is_explained() {
 }
 
 #[test]
-fn t17_failed_request_does_not_consume_cooldown() {
+fn t17_failed_request_is_rate_limited_but_not_a_cooldown() {
     let mut d = Decider::new();
     let s = cfg("Global", "5G", 0, &["A", "B"]);
     let w = st(Some(("B", 2, 70)), &[("A", 2, 80), ("B", 2, 70)]);
     let p = d.decide(&w, &s, 1000, false).connect.expect("switch to A");
-    d.connect_result(&p, false, 1000); // 系统没接受请求
-    // 清掉拉黑标记模拟“稍后重试”，冷却不应还在占用
-    d.mark_bad("A", 0);
-    assert!(d.decide(&w, &s, 1100, false).connect.is_some());
+    d.connect_result(&p, false, 1000); // 系统直接拒绝了请求
+    // 只隔 3 秒防止每 250 ms 空转；不拉黑网络，也不占用升级冷却
+    assert!(d.decide(&w, &s, 1100, false).connect.is_none());
+    assert!(d.decide(&w, &s, 3900, false).connect.is_none());
+    assert!(d.decide(&w, &s, 4100, false).connect.is_some());
+}
+
+#[test]
+fn t21_no_internet_falls_back_then_retries_without_ban() {
+    let mut d = Decider::new();
+    let s = cfg("Same", "5G", 0, &["Hotspot", "Home"]);
+    let on_hot = st(Some(("Hotspot", 2, 80)), &[("Hotspot", 2, 80), ("Home", 2, 70)]);
+    assert!(d.decide(&on_hot, &s, 1000, false).connect.is_none());
+    // 联网检测报告：热点连上了但无法上网 → 立即回退到下一个网络
+    d.report_no_internet("Hotspot");
+    let p = d.decide(&on_hot, &s, 1500, false).connect.expect("fall back");
+    assert_eq!(p.ssid, "Home");
+    // 回到 Home 之后热点不被拉黑：升级冷却（默认 8 秒）一过就再次连接
+    let on_home = st(Some(("Home", 2, 70)), &[("Hotspot", 2, 80), ("Home", 2, 70)]);
+    assert!(d.decide(&on_home, &s, 2000, false).connect.is_none());
+    assert_eq!(d.decide(&on_home, &s, 9600, false).connect.map(|p| p.ssid), Some("Hotspot".to_string()));
 }
 
 #[test]

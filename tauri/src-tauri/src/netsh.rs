@@ -91,18 +91,45 @@ pub fn add_profile(ssid: &str, password: &str) -> bool {
     ok
 }
 
-/// 联网检测：ping 两个公共 DNS，任一通即认为能上网。
+/// 联网检测：ping 和 TCP 443 同时探测两个公共地址，任何一个通就算能上网（有的热点/运营商会拦 ICMP）。
 pub fn has_internet() -> bool {
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel::<bool>();
+    let mut n = 0;
     for host in ["223.5.5.5", "1.1.1.1"] {
-        let mut cmd = Command::new("ping.exe");
-        cmd.args(["-n", "1", "-w", "1500", host])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        hide_window(&mut cmd);
-        if cmd.status().map(|s| s.success()).unwrap_or(false) {
+        let t = tx.clone();
+        n += 1;
+        std::thread::spawn(move || {
+            let _ = t.send(ping_ok(host));
+        });
+        let t = tx.clone();
+        n += 1;
+        std::thread::spawn(move || {
+            let _ = t.send(tcp_ok(host, 443));
+        });
+    }
+    drop(tx);
+    for _ in 0..n {
+        if rx.recv().unwrap_or(false) {
             return true;
         }
     }
     false
+}
+
+fn ping_ok(host: &str) -> bool {
+    let mut cmd = Command::new("ping.exe");
+    cmd.args(["-n", "1", "-w", "2000", host])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hide_window(&mut cmd);
+    cmd.status().map(|s| s.success()).unwrap_or(false)
+}
+
+fn tcp_ok(host: &str, port: u16) -> bool {
+    match format!("{}:{}", host, port).parse::<std::net::SocketAddr>() {
+        Ok(addr) => std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(2500)).is_ok(),
+        Err(_) => false,
+    }
 }

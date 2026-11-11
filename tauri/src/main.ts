@@ -138,7 +138,7 @@ const TEMPLATE = `
         <div class="setting"><span>两次“升级”切换的最短间隔（秒；信号丢失时的回落不受限制）</span><input type="number" min="0" max="3600" data-setting="CooldownSec" /></div>
         <div class="setting"><span>检测到手动换网后暂停自动切换（分钟，0 = 不暂停）</span><input type="number" min="0" max="1440" data-setting="ManualPauseMinutes" /></div>
         <label class="switch mt16"><input type="checkbox" data-setting="TakeoverUnlisted" /><span>当前连接的网络不在优先级列表里时，也自动切到列表中的网络</span></label>
-        <label class="switch"><input type="checkbox" data-setting="InternetCheck" /><span>联网检测：连上但无法上网时，视为不可用并回落</span></label>
+        <label class="switch"><input type="checkbox" data-setting="InternetCheck" /><span>联网检测：连上 12 秒后仍连续检测不到互联网时，回落到下一个网络</span></label>
         <label class="switch"><input type="checkbox" data-setting="Notify" /><span>切换时弹出系统通知</span></label>
       </div>
     </section>

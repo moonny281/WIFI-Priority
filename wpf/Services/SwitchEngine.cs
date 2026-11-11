@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
 using WifiPriority.Models;
@@ -197,42 +198,83 @@ namespace WifiPriority.Services
         }
 
         // ---------- 联网检测（独立后台任务，不阻塞切换） ----------
+        // 只用来决定“刚连上的网络能不能上网，不能就回退”。不做任何冷却：离开那个网络后不留记忆，
+        // 它还在、还是最优，就会再次连接。
         async Task InternetLoopAsync(CancellationToken ct)
         {
             int fail = 0;
+            string last = null;
+            long since = 0;
             while (!ct.IsCancellationRequested)
             {
-                try { await Task.Delay(4000, ct); } catch (OperationCanceledException) { break; }
-                if (!_s.InternetCheck) { fail = 0; continue; }
+                try { await Task.Delay(3000, ct); } catch (OperationCanceledException) { break; }
                 string cur = _curSsid;
-                if (cur == null) { fail = 0; continue; }
+                if (!_s.InternetCheck || cur == null) { fail = 0; last = null; continue; }
 
-                if (await HasInternetAsync()) fail = 0;
-                else if (++fail >= 2)
+                // 刚连上（DHCP 还没完成、路由还没通）的 12 秒内不检测，避免把正在握手的热点误判成“无法上网”
+                if (cur != last) { last = cur; since = Now; fail = 0; continue; }
+                if (Now - since < 12000) continue;
+                if (_dec.ActiveTarget != null) continue;
+
+                if (await HasInternetAsync())
                 {
                     fail = 0;
-                    _dec.MarkBad(cur, Now + 300000);
-                    Log?.Invoke($"{cur} 已连接但无法上网，5 分钟内视为不可用");
-                    TriggerNow();
+                    _dec.ClearNoInternet(cur);
+                }
+                else if (++fail >= 3)       // 连续 3 次（约 9 秒）都不通才回退
+                {
+                    fail = 0;
+                    if (!_dec.IsNoInternet(cur))
+                    {
+                        _dec.ReportNoInternet(cur);
+                        Log?.Invoke($"{cur} 已连接但无法上网，回退到下一个可用网络");
+                        TriggerNow();
+                    }
                 }
             }
         }
 
+        /// <summary>ping 和 TCP 443 同时探测两个公共地址，任何一个通就算能上网（有的热点/运营商会拦 ICMP）。</summary>
         static async Task<bool> HasInternetAsync()
         {
-            foreach (var host in new[] { "223.5.5.5", "1.1.1.1" })
+            var tasks = new List<Task<bool>>
             {
-                try
-                {
-                    using (var p = new Ping())
-                    {
-                        var r = await p.SendPingAsync(host, 1500);
-                        if (r.Status == IPStatus.Success) return true;
-                    }
-                }
-                catch { }
+                PingOkAsync("223.5.5.5"), PingOkAsync("1.1.1.1"),
+                TcpOkAsync("223.5.5.5", 443), TcpOkAsync("1.1.1.1", 443)
+            };
+            while (tasks.Count > 0)
+            {
+                var t = await Task.WhenAny(tasks);
+                tasks.Remove(t);
+                if (t.Result) return true;
             }
             return false;
+        }
+
+        static async Task<bool> PingOkAsync(string host)
+        {
+            try
+            {
+                using (var p = new Ping())
+                {
+                    var r = await p.SendPingAsync(host, 2000);
+                    return r.Status == IPStatus.Success;
+                }
+            }
+            catch { return false; }
+        }
+
+        static async Task<bool> TcpOkAsync(string host, int port)
+        {
+            try
+            {
+                using (var c = new TcpClient())
+                {
+                    var t = c.ConnectAsync(host, port);
+                    return await Task.WhenAny(t, Task.Delay(2500)) == t && t.Status == TaskStatus.RanToCompletion;
+                }
+            }
+            catch { return false; }
         }
 
         // ---------- 发布给界面（限频：状态没变化时每 2 秒一次） ----------

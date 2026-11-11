@@ -71,6 +71,8 @@ pub struct Decider {
     last_diag_at: i64,
     last_order_diag_at: i64,
     disc_at: i64, // 本次“未连接”状态开始的时间（0 = 当前不是未连接）
+    not_before: i64, // 系统直接拒绝连接请求后，至少隔 3 秒再试（防止每 250 ms 空转，不是网络冷却）
+    no_net: Arc<Mutex<Option<String>>>, // 当前连着、但检测不到互联网的 WiFi。离开它就清除，不留冷却
     bad: BadMap,
 }
 
@@ -170,6 +172,8 @@ impl Decider {
             last_diag_at: NEVER,
             last_order_diag_at: NEVER,
             disc_at: 0,
+            not_before: 0,
+            no_net: Arc::new(Mutex::new(None)),
             bad: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -177,6 +181,15 @@ impl Decider {
     /// 联网检测线程用它来标记“暂时不可用”的网络。
     pub fn bad_handle(&self) -> BadMap {
         self.bad.clone()
+    }
+
+    /// 联网检测线程用它报告/清除“当前网络无法上网”。
+    pub fn no_net_handle(&self) -> Arc<Mutex<Option<String>>> {
+        self.no_net.clone()
+    }
+
+    pub fn report_no_internet(&self, ssid: &str) {
+        *self.no_net.lock().unwrap() = Some(ssid.to_string());
     }
 
     pub fn mark_bad(&self, key: &str, until_ms: i64) {
@@ -189,13 +202,13 @@ impl Decider {
     }
 
     /// 引擎执行连接后回报结果（ok = false 表示系统没有接受连接请求）。
-    pub fn connect_result(&mut self, p: &Plan, ok: bool, now: i64) {
+    pub fn connect_result(&mut self, _p: &Plan, ok: bool, now: i64) {
         if ok {
             return;
         }
         self.last_plan = None;
         self.last_switch = NEVER; // 请求根本没发出去，不该占用升级冷却
-        self.mark_bad(&p.ssid, now + 120_000);
+        self.not_before = now + 3000;
     }
 
     pub fn decide(&mut self, st: &WifiState, s: &Settings, now: i64, paused_in: bool) -> Decision {
@@ -205,6 +218,18 @@ impl Decider {
         } else if self.disc_at == 0 {
             self.disc_at = now;
         }
+        {
+            // 离开了那个无网络的 WiFi：不留记忆
+            let mut g = self.no_net.lock().unwrap();
+            let keep = match g.as_ref() {
+                Some(n) => st.connected && st.ssid == *n,
+                None => true,
+            };
+            if !keep {
+                *g = None;
+            }
+        }
+        let no_net: Option<String> = self.no_net.lock().unwrap().clone();
         let mut paused = paused_in;
         let cur: Option<&str> = if st.connected { Some(st.ssid.as_str()) } else { None };
 
@@ -233,14 +258,14 @@ impl Decider {
                     return d;
                 }
                 if on_target {
-                    self.mark_bad(&lp.key(), now + 600_000);
+                    self.mark_bad(&lp.key(), now + 120_000); // 只针对“指定这个频段”，不影响连接这个网络
                     d.logs.push(format!(
-                        "未能切换到 {}（路由器或网卡驱动没有接受），10 分钟内不再尝试该频段",
+                        "未能切换到 {}（路由器或网卡驱动没有接受），2 分钟内不再尝试指定该频段",
                         label(&lp.ssid, lp.band)
                     ));
                 } else {
-                    self.mark_bad(&lp.ssid, now + 30_000);
-                    d.logs.push(format!("连接 {} 没有成功，30 秒内不再尝试", lp.ssid));
+                    // 不做失败冷却：目标网络还在、还是最优，就会再次尝试
+                    d.logs.push(format!("连接 {} 没有成功，将再次尝试", lp.ssid));
                 }
                 self.last_plan = None;
             }
@@ -287,6 +312,9 @@ impl Decider {
         if !st.connected && now - self.disc_at < DISC_GRACE_MS {
             return d;
         }
+        if now < self.not_before {
+            return d;
+        }
 
         let pri: Vec<String> = s.priorities.clone();
         let policy: &str = match s.band_policy.as_str() {
@@ -304,7 +332,7 @@ impl Decider {
                 None => false,
             }
         };
-        let is_bad = |c: &Cand| -> bool { is_bad_key(&bad, &c.ssid, now) || is_bad_key(&bad, &c.key(), now) };
+        let is_bad = |c: &Cand| -> bool { is_bad_key(&bad, &c.key(), now) || no_net.as_deref() == Some(c.ssid.as_str()) };
 
         let cur_signal: Option<i64> = cands.iter().filter(|c| is_current(c)).map(|c| c.signal).max();
         let cur_bad = cands.iter().filter(|c| is_current(c)).any(|c| is_bad(c));
@@ -339,7 +367,7 @@ impl Decider {
         if held && now - self.last_diag_at > 30_000 {
             let why = |c: &Cand| -> Option<String> {
                 if is_bad(c) {
-                    return Some("处于失败冷却中".to_string());
+                    return Some("刚才没连上或无法上网，暂不选它".to_string());
                 }
                 let saved = !c.profile.is_empty()
                     && (st.profiles.contains(&c.profile) || st.profiles.contains(&c.ssid));
