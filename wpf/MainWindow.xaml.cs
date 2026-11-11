@@ -390,12 +390,14 @@ namespace WifiPriority
 
             TbInterval.Text = S.ScanIntervalSec.ToString();
             TbUp.Text = S.UpThreshold.ToString();
+            TbMinSignal.Text = S.MinConnectSignal.ToString();
             TbDown.Text = S.DownThreshold.ToString();
             TbConfirmMs.Text = S.ConfirmMs.ToString();
             TbCooldown.Text = S.CooldownSec.ToString();
             TbManualPause.Text = S.ManualPauseMinutes.ToString();
             SwTakeover.IsChecked = S.TakeoverUnlisted;
             SwInternet.IsChecked = S.InternetCheck;
+            SwStale.IsChecked = S.StaleFilter;
             SwNotify.IsChecked = S.Notify;
 
             ThemeSystem.IsChecked = S.Theme == "System";
@@ -425,6 +427,7 @@ namespace WifiPriority
             if (!_ready || _loading) return;
             S.ScanIntervalSec = ParseInt(TbInterval, S.ScanIntervalSec, 0, 600);
             S.UpThreshold = ParseInt(TbUp, S.UpThreshold, 10, 100);
+            S.MinConnectSignal = ParseInt(TbMinSignal, S.MinConnectSignal, 0, 100);
             S.DownThreshold = ParseInt(TbDown, S.DownThreshold, 0, 95);
             if (S.DownThreshold > S.UpThreshold) { S.DownThreshold = S.UpThreshold; TbDown.Text = S.DownThreshold.ToString(); }
             S.ConfirmMs = ParseInt(TbConfirmMs, S.ConfirmMs, 0, 10000);
@@ -432,6 +435,7 @@ namespace WifiPriority
             S.ManualPauseMinutes = ParseInt(TbManualPause, S.ManualPauseMinutes, 0, 1440);
             S.TakeoverUnlisted = SwTakeover.IsChecked == true;
             S.InternetCheck = SwInternet.IsChecked == true;
+            S.StaleFilter = SwStale.IsChecked == true;
             S.Notify = SwNotify.IsChecked == true;
             App.SaveSettings();
             RefreshPauseUi();

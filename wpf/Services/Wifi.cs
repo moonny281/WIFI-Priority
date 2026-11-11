@@ -20,6 +20,8 @@ namespace WifiPriority.Services
         public int Chan;
         public int Rssi;     // dBm（原生读取时才有）
         public int Iface;    // 来自第几块无线网卡
+        public ulong HostTs; // WLAN_BSS_ENTRY.ullHostTimestamp：收到这个接入点最近一帧的时间戳（0 = 驱动没给）
+        public bool Stale;   // true = 缓存里的“幽灵”条目（接入点其实已经不在了），由 BssFreshness 标记
     }
 
     /// <summary>一个 WiFi 名称（SSID）下所有接入点的汇总。</summary>

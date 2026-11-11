@@ -5,6 +5,7 @@ mod autostart;
 mod commands;
 mod decide;
 mod engine;
+mod freshness;
 mod model;
 mod native;
 mod netsh;

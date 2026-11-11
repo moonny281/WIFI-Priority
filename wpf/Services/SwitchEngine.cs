@@ -46,7 +46,9 @@ namespace WifiPriority.Services
 
         long Now => _clock.ElapsedMilliseconds;
 
-        public SwitchEngine(AppSettings s) { _s = s; }
+        readonly BssFreshness _fresh;   // 识别缓存里已经消失的接入点
+
+        public SwitchEngine(AppSettings s) { _s = s; _fresh = new BssFreshness(Now); }
 
         public void Start()
         {
@@ -73,6 +75,7 @@ namespace WifiPriority.Services
         void OnWlanEvent(uint code)
         {
             if (code == 7 || code == 8) _scanBusy = false;   // 扫描完成 / 失败
+            if (code == 7) _fresh.ScanDone(Now);
             TriggerNow();
         }
 
@@ -113,14 +116,6 @@ namespace WifiPriority.Services
             if (_scanBusy && now - _lastScanAt < 6000) return;      // 上一次扫描还没完成
             _lastScanAt = now;
             bool ok = _wlan.Scan();
-
-            // 对排在当前网络前面的优先网络做定向扫描（最多 5 个），更快发现新出现的高优先级网络
-            var pri = _s.Priorities.ToList();
-            string cur = _curSsid;
-            int limit = cur == null ? pri.Count : pri.IndexOf(cur);
-            if (limit < 0) limit = pri.Count;
-            for (int i = 0; i < limit && i < 5; i++) _wlan.ScanDirected(pri[i]);
-
             _scanBusy = ok;   // 请求没被接受就不会有“扫描完成”通知，别挂着空等
         }
 
@@ -167,6 +162,7 @@ namespace WifiPriority.Services
                 st = await Wifi.ReadStateAsync();
             }
 
+            _fresh.Apply(st, Now);
             EnsureCurrent(st);
             _curSsid = st.Connected ? st.Ssid : null;
             if (st.Connecting) _connectingSeenAt = Now;

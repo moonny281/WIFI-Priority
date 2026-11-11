@@ -60,6 +60,8 @@ namespace WifiPriority.Services
         readonly Dictionary<string, long> _bad = new Dictionary<string, long>();   // 仅用于“指定频段失败”（频段级，不是网络级）
         volatile string _noNet;     // 当前连着、但检测不到互联网的 WiFi。一旦离开它就清除，不留冷却
         long _notBefore;            // 系统直接拒绝连接请求后，至少隔 3 秒再试（防止每 250 ms 空转，不是网络冷却）
+        string _skipSsid;           // 断网状态下刚连失败的网络：15 秒内先试下一个，别在断网时只盯着它死磕（连上任何网络后失效）
+        long _skipUntil;
 
         /// <summary>联网检测报告：当前连着的这个网络无法上网 → 本轮决策把它当作不可用，回退到下一个。</summary>
         public void ReportNoInternet(string ssid) { _noNet = ssid; }
@@ -90,7 +92,7 @@ namespace WifiPriority.Services
         static string Label(string ssid, int band) =>
             band > 0 && ssid != null ? $"{ssid}（{Wifi.BandName(band)}）" : ssid;
 
-        static List<Cand> BuildCands(WifiState st, List<string> pri, string policy)
+        static List<Cand> BuildCands(WifiState st, List<string> pri, string policy, bool staleFilter)
         {
             var list = new List<Cand>();
             for (int i = 0; i < pri.Count; i++)
@@ -98,19 +100,23 @@ namespace WifiPriority.Services
                 var n = st.Nearby.FirstOrDefault(x => x.Ssid == pri[i]);
                 if (n == null) continue;
 
+                // 已消失接入点的缓存条目不参与（Windows 的 BSS 缓存会把关掉的热点留好一阵子，信号还是旧的）
+                var live = staleFilter ? n.Bss.Where(b => !b.Stale).ToList() : n.Bss;
+
                 if (policy == "Off" || n.Bss.Count == 0)
                 {
-                    var any = n.Bss.OrderByDescending(x => x.Signal).FirstOrDefault();
+                    var any = live.OrderByDescending(x => x.Signal).FirstOrDefault();
+                    if (any == null && n.Bss.Count > 0) continue;   // 只剩过期条目：这个网络其实不在
                     list.Add(new Cand
                     {
                         Ssid = n.Ssid, Band = 0, Bssid = null, Rank = i, Profile = n.Profile ?? n.Ssid,
                         Iface = any != null ? any.Iface : -1,
-                        Signal = st.Connected && n.Ssid == st.Ssid ? st.Signal : n.Signal
+                        Signal = st.Connected && n.Ssid == st.Ssid ? st.Signal : (any != null ? any.Signal : n.Signal)
                     });
                     continue;
                 }
                 // 每个频段取信号最强的接入点
-                foreach (var g in n.Bss.GroupBy(b => b.Band))
+                foreach (var g in live.GroupBy(b => b.Band))
                 {
                     var b = g.OrderByDescending(x => x.Signal).First();
                     list.Add(new Cand
@@ -178,8 +184,10 @@ namespace WifiPriority.Services
                     }
                     else
                     {
-                        // 不做失败冷却：目标网络还在、还是最优，就会再次尝试
+                        // 不做失败冷却：目标网络还在、还是最优，就会再次尝试。
+                        // 唯一的例外：断网状态下，先让下一个候选试一次，别在断网时只盯着失败的那个死磕。
                         d.Logs.Add($"连接 {_lastPlan.Ssid} 没有成功，将再次尝试");
+                        if (cur == null) { _skipSsid = _lastPlan.Ssid; _skipUntil = now + 15000; }
                     }
                     _lastPlan = null;
                 }
@@ -219,12 +227,13 @@ namespace WifiPriority.Services
             var pri = s.Priorities.ToList();
             string policy = s.BandPolicy == "Off" || s.BandPolicy == "Global" ? s.BandPolicy : "Same";
             bool prefer24 = s.PreferBand == "2.4G";
-            var cands = BuildCands(st, pri, policy);
+            var cands = BuildCands(st, pri, policy, s.StaleFilter);
 
             bool IsCurrent(Cand c) =>
                 cur != null && c.Ssid == cur && (policy == "Off" || st.CurBand == 0 || c.Band == st.CurBand);
 
-            bool IsBad(Cand c) => IsBadKey(c.Key, now) || (_noNet != null && c.Ssid == _noNet);
+            bool IsBad(Cand c) => IsBadKey(c.Key, now) || (_noNet != null && c.Ssid == _noNet)
+                || (cur == null && _skipSsid != null && c.Ssid == _skipSsid && now < _skipUntil);
 
             var curCand = cands.Where(IsCurrent).OrderByDescending(c => c.Signal).FirstOrDefault();
             bool curListed = cur != null && pri.Contains(cur);
@@ -240,6 +249,7 @@ namespace WifiPriority.Services
                 bool saved = !string.IsNullOrEmpty(c.Profile) && (st.Profiles.Contains(c.Profile) || st.Profiles.Contains(c.Ssid));
                 if (!isCur && !saved) return false;                     // 没有已保存配置，无法连接
                 int th = (isCur || relaxed) ? s.DownThreshold : s.UpThreshold;
+                if (!isCur) th = Math.Max(th, s.MinConnectSignal);       // 连接任何新网络都要达到“最低连接信号”
                 return c.Signal >= th;
             }
 
@@ -249,8 +259,9 @@ namespace WifiPriority.Services
                 bool saved = !string.IsNullOrEmpty(c.Profile) && (st.Profiles.Contains(c.Profile) || st.Profiles.Contains(c.Ssid));
                 if (!saved && !IsCurrent(c)) return "没有已保存的配置文件";
                 int th = relaxed ? s.DownThreshold : s.UpThreshold;
-                string kind = relaxed ? "回落" : "升级";
-                return c.Signal < th ? $"信号 {c.Signal}% 低于{kind}阈值 {th}%" : null;
+                string kind = relaxed ? "回落阈值" : "升级阈值";
+                if (!IsCurrent(c) && s.MinConnectSignal > th) { th = s.MinConnectSignal; kind = "最低连接信号"; }
+                return c.Signal < th ? $"信号 {c.Signal}% 低于{kind} {th}%" : null;
             }
 
             var ordered = Order(cands, policy, prefer24).ToList();

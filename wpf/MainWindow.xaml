@@ -323,6 +323,10 @@
                                 <TextBox x:Name="TbUp" Width="84" HorizontalAlignment="Right" TextAlignment="Right" LostFocus="Settings_Changed"/>
                             </Grid>
                             <Grid Margin="0,6">
+                                <TextBlock Text="最低连接信号 (%)：目标网络信号达不到它就不去连（0 = 不限制）" VerticalAlignment="Center"/>
+                                <TextBox x:Name="TbMinSignal" Width="84" HorizontalAlignment="Right" TextAlignment="Right" LostFocus="Settings_Changed"/>
+                            </Grid>
+                            <Grid Margin="0,6">
                                 <TextBlock Text="当前网络信号低于 (%) 视为过弱/消失，回落到次优先级" VerticalAlignment="Center"/>
                                 <TextBox x:Name="TbDown" Width="84" HorizontalAlignment="Right" TextAlignment="Right" LostFocus="Settings_Changed"/>
                             </Grid>
@@ -342,6 +346,8 @@
                             <CheckBox x:Name="SwTakeover" Content="当前连接的网络不在优先级列表里时，也自动切到列表中的网络"
                                       Style="{StaticResource Switch}" Margin="0,16,0,0" Click="Settings_Changed"/>
                             <CheckBox x:Name="SwInternet" Content="联网检测：连上 12 秒后仍连续检测不到互联网时，回落到下一个网络"
+                                      Style="{StaticResource Switch}" Margin="0,12,0,0" Click="Settings_Changed"/>
+                            <CheckBox x:Name="SwStale" Content="忽略已经消失的网络：Windows 会把关掉的热点在缓存里留一阵子，开启后不再去连它（推荐）"
                                       Style="{StaticResource Switch}" Margin="0,12,0,0" Click="Settings_Changed"/>
                             <CheckBox x:Name="SwNotify" Content="切换时弹出系统通知"
                                       Style="{StaticResource Switch}" Margin="0,12,0,0" Click="Settings_Changed"/>

@@ -41,6 +41,8 @@ namespace WifiPriority.Models
         public string OverlayAnchor { get; set; } = "TopRight"; // TopLeft/TopRight/BottomLeft/BottomRight/Free
         public double OverlayX { get; set; } = 0;
         public double OverlayY { get; set; } = 0;
+        public int MinConnectSignal { get; set; } = 50;   // 连接任何“新网络”所需的最低信号（%）；低于它不会去连
+        public bool StaleFilter { get; set; } = true;     // 忽略 Windows 缓存里已经消失的网络（关掉的热点）
         public string OverlayLayer { get; set; } = "Top";  // Top = 悬浮在所有窗口之上；Desktop = 只在桌面
     }
 

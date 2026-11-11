@@ -1,4 +1,5 @@
 use crate::decide::*;
+use crate::freshness::Freshness;
 use crate::model::*;
 use crate::parse::*;
 
@@ -39,6 +40,7 @@ fn cfg(policy: &str, prefer: &str, confirm: i64, pri: &[&str]) -> Settings {
     s.prefer_band = prefer.into();
     s.confirm_ms = confirm;
     s.cooldown_sec = 8;
+    s.min_connect_signal = 0; // 旧用例不涉及“最低连接信号”，新用例自己设置
     s.priorities = pri.iter().map(|x| x.to_string()).collect();
     s
 }
@@ -286,6 +288,116 @@ fn t21_no_internet_falls_back_then_retries_without_ban() {
 }
 
 #[test]
+fn t22_stale_cached_hotspot_is_not_a_target() {
+    // 热点已经关了，但 Windows 缓存里还留着它的旧条目（信号还很高）：不能把它当目标，更不能一直重试
+    let mut w = st(Some(("B", 2, 70)), &[("A", 2, 90), ("B", 2, 70)]);
+    for b in w.nearby.iter_mut().find(|n| n.ssid == "A").unwrap().bss.iter_mut() {
+        b.stale = true;
+    }
+    let s = cfg("Global", "5G", 0, &["A", "B"]);
+    let mut d = Decider::new();
+    assert!(d.decide(&w, &s, 1000, false).connect.is_none());
+    // 关掉“忽略已消失的网络”后恢复旧行为
+    let mut s2 = cfg("Global", "5G", 0, &["A", "B"]);
+    s2.stale_filter = false;
+    let mut d = Decider::new();
+    assert_eq!(d.decide(&w, &s2, 1000, false).connect.map(|p| p.ssid), Some("A".to_string()));
+}
+
+#[test]
+fn t23_min_connect_signal_gates_every_new_connection() {
+    let w = st(Some(("B", 2, 70)), &[("A", 2, 65), ("B", 2, 70)]);
+    // 最低连接信号 70：A 只有 65%，不连（即使满足升级阈值 60%），并且日志说明原因
+    let mut s = cfg("Global", "5G", 0, &["A", "B"]);
+    s.min_connect_signal = 70;
+    let mut d = Decider::new();
+    let r = d.decide(&w, &s, 1000, false);
+    assert!(r.connect.is_none());
+    assert!(r.logs.iter().any(|l| l.contains("最低连接信号")));
+    // 调到 50：A 的 65% 够了，立即切
+    s.min_connect_signal = 50;
+    let mut d = Decider::new();
+    assert_eq!(d.decide(&w, &s, 1000, false).connect.map(|p| p.ssid), Some("A".to_string()));
+    // 未连接 + 回落场景同样受限：唯一的候选信号 45%，最低连接信号 50 → 不连；设为 0 → 连
+    let off = st(None, &[("B", 2, 45)]);
+    let mut d = Decider::new();
+    assert!(d.decide(&off, &s, 1000, false).connect.is_none());
+    assert!(d.decide(&off, &s, 2300, false).connect.is_none());
+    s.min_connect_signal = 0;
+    let mut d = Decider::new();
+    assert!(d.decide(&off, &s, 1000, false).connect.is_none()); // 刚断开的 1.2 秒内先等
+    assert!(d.decide(&off, &s, 2300, false).connect.is_some());
+}
+
+#[test]
+fn f1_ghost_entry_is_flagged_after_scans() {
+    let mut f = Freshness::new(0);
+    // 启动时缓存里就有的条目：未确认
+    let mut s = ghost_state(100);
+    f.apply(&mut s, 100);
+    assert!(s.nearby[0].bss[0].stale);
+    // 扫描完成，时间戳变了 → 确认在场
+    f.scan_done(3000);
+    let mut s = ghost_state(200);
+    f.apply(&mut s, 3100);
+    assert!(!s.nearby[0].bss[0].stale);
+    // 热点关了：时间戳不再变化。再完成两次扫描 → 判为已消失
+    f.scan_done(6000);
+    f.scan_done(9000);
+    let mut s = ghost_state(200);
+    f.apply(&mut s, 9100);
+    assert!(s.nearby[0].bss[0].stale);
+    // 热点又开了：时间戳变化 → 立刻恢复在场
+    let mut s = ghost_state(300);
+    f.apply(&mut s, 9200);
+    assert!(!s.nearby[0].bss[0].stale);
+}
+
+#[test]
+fn f2_new_entry_after_scan_is_fresh_and_no_scan_notification_relaxes() {
+    // 启动之后才第一次出现的条目一定是刚收到的帧，算在场
+    let mut f = Freshness::new(0);
+    f.scan_done(1000);
+    let mut s = ghost_state(500);
+    f.apply(&mut s, 2000);
+    assert!(!s.nearby[0].bss[0].stale);
+    // 一直收不到“扫描完成”通知：15 秒内先当未确认，之后放宽（避免永远不切换）
+    let mut g = Freshness::new(0);
+    let mut s = ghost_state(5);
+    g.apply(&mut s, 100);
+    assert!(s.nearby[0].bss[0].stale);
+    let mut s = ghost_state(5);
+    g.apply(&mut s, 16_000);
+    assert!(!s.nearby[0].bss[0].stale);
+}
+
+#[test]
+fn f3_current_bssid_and_missing_timestamp_are_never_stale() {
+    let mut f = Freshness::new(0);
+    let mut s = ghost_state(100);
+    s.cur_bssid = Some("AA:BB:CC:DD:EE:01".to_string()); // 大小写不同也要认出来
+    f.apply(&mut s, 100);
+    assert!(!s.nearby[0].bss[0].stale);
+    let mut s = ghost_state(0); // 驱动没给时间戳
+    f.apply(&mut s, 200);
+    assert!(!s.nearby[0].bss[0].stale);
+}
+
+#[test]
+fn t24_offline_failure_tries_next_candidate_instead_of_hammering() {
+    // 断网状态下：热点（最高优先级）连失败后，下一轮先试第二优先级，不是原地死磕
+    let mut d = Decider::new();
+    let s = cfg("Same", "5G", 0, &["Hotspot", "Home"]);
+    let off = st(None, &[("Hotspot", 2, 80), ("Home", 2, 70)]);
+    assert!(d.decide(&off, &s, 1000, false).connect.is_none()); // 刚断开，先等 1.2 秒
+    let p = d.decide(&off, &s, 2300, false).connect.expect("try hotspot");
+    assert_eq!(p.ssid, "Hotspot");
+    let r = d.decide(&off, &s, 6500, false); // 4 秒还是没连上（仍未连接）
+    assert!(r.logs.iter().any(|l| l.contains("没有成功")));
+    assert_eq!(r.connect.map(|p| p.ssid), Some("Home".to_string()));
+}
+
+#[test]
 fn t18_active_target_reports_pending_switch() {
     let mut d = Decider::new();
     let s = cfg("Global", "5G", 0, &["A", "B"]);
@@ -326,6 +438,18 @@ fn s6_band_policy_migration_global_to_same() {
 }
 
 #[test]
+fn s7_min_connect_signal_and_stale_filter_defaults() {
+    let mut s = Settings::fresh();
+    assert_eq!((s.min_connect_signal, s.stale_filter), (50, true));
+    s.min_connect_signal = 500;
+    s.sanitize();
+    assert_eq!(s.min_connect_signal, 100);
+    // 旧配置文件没有这两个字段 → 取默认值
+    let old = Settings::from_json(r#"{"SchemaVersion":3,"Priorities":["Home"]}"#).unwrap();
+    assert_eq!((old.min_connect_signal, old.stale_filter), (50, true));
+}
+
+#[test]
 fn s5_overlay_layer_default_and_sanitize() {
     let mut s = Settings::fresh();
     assert_eq!(s.overlay_layer, "Top");
@@ -335,6 +459,16 @@ fn s5_overlay_layer_default_and_sanitize() {
     // 旧配置文件没有这个字段 → 取默认值
     let old = Settings::from_json(r#"{"SchemaVersion":2,"Priorities":["Home"]}"#).unwrap();
     assert_eq!(old.overlay_layer, "Top");
+}
+
+fn ghost_state(ts: u64) -> WifiState {
+    let mut s = WifiState::new();
+    s.nearby.push(NearbyNetwork {
+        ssid: "Hot".to_string(),
+        bss: vec![BssInfo { bssid: "aa:bb:cc:dd:ee:01".to_string(), host_ts: ts, band: 2, signal: 80, ..Default::default() }],
+        ..Default::default()
+    });
+    s
 }
 
 // ---------------- netsh 解析 ----------------

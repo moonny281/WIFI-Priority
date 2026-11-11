@@ -77,6 +77,9 @@ unsafe extern "system" fn on_notify(data: *mut c_void, _ctx: *mut c_void) {
 unsafe fn rd_u32(p: *const u8, off: usize) -> u32 {
     read_unaligned(p.add(off) as *const u32)
 }
+unsafe fn rd_u64(p: *const u8, off: usize) -> u64 {
+    read_unaligned(p.add(off) as *const u64)
+}
 unsafe fn rd_i32(p: *const u8, off: usize) -> i32 {
     read_unaligned(p.add(off) as *const i32)
 }
@@ -343,6 +346,8 @@ impl Client {
                             chan: 0,
                             rssi,
                             iface: i as i32,
+                            host_ts: rd_u64(p, base + 80),
+                            stale: false,
                         });
                     }
                     WlanFreeMemory(blist);

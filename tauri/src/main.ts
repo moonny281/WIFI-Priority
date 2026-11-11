@@ -133,12 +133,14 @@ const TEMPLATE = `
         <div class="sub mt8" style="margin-bottom:10px">信号强度是 Windows 报告的百分比（约等于 2 × (dBm + 100)，60% ≈ −70 dBm，40% ≈ −80 dBm）。</div>
         <div class="setting"><span>主动扫描间隔（秒，0 = 连续扫描，最快）</span><input type="number" min="0" max="600" data-setting="ScanIntervalSec" /></div>
         <div class="setting"><span>切换到更高优先级所需的信号 ≥ (%)</span><input type="number" min="10" max="100" data-setting="UpThreshold" /></div>
+        <div class="setting"><span>最低连接信号 (%)：目标网络信号达不到它就不去连（0 = 不限制）</span><input type="number" min="0" max="100" data-setting="MinConnectSignal" /></div>
         <div class="setting"><span>当前网络信号低于 (%) 视为过弱/消失，回落到次优先级</span><input type="number" min="0" max="95" data-setting="DownThreshold" /></div>
         <div class="setting"><span>确认时间（毫秒，候选保持最优这么久才切换，0 = 立即）</span><input type="number" min="0" max="10000" data-setting="ConfirmMs" /></div>
         <div class="setting"><span>两次“升级”切换的最短间隔（秒；信号丢失时的回落不受限制）</span><input type="number" min="0" max="3600" data-setting="CooldownSec" /></div>
         <div class="setting"><span>检测到手动换网后暂停自动切换（分钟，0 = 不暂停）</span><input type="number" min="0" max="1440" data-setting="ManualPauseMinutes" /></div>
         <label class="switch mt16"><input type="checkbox" data-setting="TakeoverUnlisted" /><span>当前连接的网络不在优先级列表里时，也自动切到列表中的网络</span></label>
         <label class="switch"><input type="checkbox" data-setting="InternetCheck" /><span>联网检测：连上 12 秒后仍连续检测不到互联网时，回落到下一个网络</span></label>
+        <label class="switch"><input type="checkbox" data-setting="StaleFilter" /><span>忽略已经消失的网络：Windows 会把关掉的热点在缓存里留一阵子，开启后不再去连它（推荐）</span></label>
         <label class="switch"><input type="checkbox" data-setting="Notify" /><span>切换时弹出系统通知</span></label>
       </div>
     </section>

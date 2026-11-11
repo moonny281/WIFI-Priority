@@ -18,6 +18,8 @@ pub struct Settings {
     // 切换策略
     pub scan_interval_sec: i64,
     pub up_threshold: i64,
+    pub min_connect_signal: i64, // 连接任何“新网络”所需的最低信号（%）；低于它不会去连
+    pub stale_filter: bool,      // 忽略 Windows 缓存里已经消失的网络（关掉的热点）
     pub down_threshold: i64,
     pub confirm_ms: i64,
     pub cooldown_sec: i64,
@@ -52,6 +54,8 @@ impl Default for Settings {
             priorities: Vec::new(),
             scan_interval_sec: 3,
             up_threshold: 60,
+            min_connect_signal: 50,
+            stale_filter: true,
             down_threshold: 40,
             confirm_ms: 400,
             cooldown_sec: 8,
@@ -107,6 +111,7 @@ impl Settings {
     /// 把各项限制在合法范围内。
     pub fn sanitize(&mut self) {
         self.scan_interval_sec = self.scan_interval_sec.clamp(0, 600);
+        self.min_connect_signal = self.min_connect_signal.clamp(0, 100);
         self.up_threshold = self.up_threshold.clamp(10, 100);
         self.down_threshold = self.down_threshold.clamp(0, 95);
         if self.down_threshold > self.up_threshold {
@@ -153,6 +158,10 @@ pub struct BssInfo {
     pub chan: i32,
     pub rssi: i32,
     pub iface: i32,
+    #[serde(skip)]
+    pub host_ts: u64, // WLAN_BSS_ENTRY.ullHostTimestamp：收到这个接入点最近一帧的时间戳（0 = 驱动没给）
+    #[serde(skip)]
+    pub stale: bool, // true = 缓存里的“幽灵”条目（接入点其实已经不在了），由 Freshness 标记
 }
 
 #[derive(Serialize, Clone, Debug, Default)]

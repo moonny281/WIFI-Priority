@@ -72,6 +72,8 @@ pub struct Decider {
     last_order_diag_at: i64,
     disc_at: i64, // 本次“未连接”状态开始的时间（0 = 当前不是未连接）
     not_before: i64, // 系统直接拒绝连接请求后，至少隔 3 秒再试（防止每 250 ms 空转，不是网络冷却）
+    skip_ssid: Option<String>, // 断网状态下刚连失败的网络：15 秒内先试下一个，别在断网时只盯着它死磕
+    skip_until: i64,
     no_net: Arc<Mutex<Option<String>>>, // 当前连着、但检测不到互联网的 WiFi。离开它就清除，不留冷却
     bad: BadMap,
 }
@@ -88,7 +90,7 @@ fn is_bad_key(bad: &BadMap, key: &str, now: i64) -> bool {
     bad.lock().unwrap().get(key).map(|&u| u > now).unwrap_or(false)
 }
 
-fn build_cands(st: &WifiState, pri: &[String], policy: &str) -> Vec<Cand> {
+fn build_cands(st: &WifiState, pri: &[String], policy: &str, stale_filter: bool) -> Vec<Cand> {
     let mut list = Vec::new();
     for (i, p) in pri.iter().enumerate() {
         let n = match st.nearby.iter().find(|x| &x.ssid == p) {
@@ -97,25 +99,31 @@ fn build_cands(st: &WifiState, pri: &[String], policy: &str) -> Vec<Cand> {
         };
         let profile = n.profile.clone().unwrap_or_else(|| n.ssid.clone());
 
+        // 已消失接入点的缓存条目不参与（Windows 的 BSS 缓存会把关掉的热点留好一阵子，信号还是旧的）
+        let live: Vec<&BssInfo> = n.bss.iter().filter(|b| !(stale_filter && b.stale)).collect();
+
         if policy == "Off" || n.bss.is_empty() {
-            let any = n.bss.iter().max_by_key(|b| b.signal);
+            let any = live.iter().copied().max_by_key(|b| b.signal);
+            if any.is_none() && !n.bss.is_empty() {
+                continue; // 只剩过期条目：这个网络其实不在
+            }
             list.push(Cand {
                 ssid: n.ssid.clone(),
                 bssid: None,
                 profile,
                 band: 0,
-                signal: if st.connected && n.ssid == st.ssid { st.signal } else { n.signal },
+                signal: if st.connected && n.ssid == st.ssid { st.signal } else { any.map(|b| b.signal).unwrap_or(n.signal) },
                 rank: i,
                 iface: any.map(|b| b.iface).unwrap_or(-1),
             });
             continue;
         }
         // 每个频段取信号最强的接入点
-        let mut bands: Vec<i32> = n.bss.iter().map(|b| b.band).collect();
+        let mut bands: Vec<i32> = live.iter().map(|b| b.band).collect();
         bands.sort_unstable();
         bands.dedup();
         for bd in bands {
-            let b = n.bss.iter().filter(|x| x.band == bd).max_by_key(|x| x.signal).unwrap();
+            let b = live.iter().copied().filter(|x| x.band == bd).max_by_key(|x| x.signal).unwrap();
             list.push(Cand {
                 ssid: n.ssid.clone(),
                 bssid: Some(b.bssid.clone()),
@@ -173,6 +181,8 @@ impl Decider {
             last_order_diag_at: NEVER,
             disc_at: 0,
             not_before: 0,
+            skip_ssid: None,
+            skip_until: 0,
             no_net: Arc::new(Mutex::new(None)),
             bad: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -264,8 +274,13 @@ impl Decider {
                         label(&lp.ssid, lp.band)
                     ));
                 } else {
-                    // 不做失败冷却：目标网络还在、还是最优，就会再次尝试
+                    // 不做失败冷却：目标网络还在、还是最优，就会再次尝试。
+                    // 唯一的例外：断网状态下，先让下一个候选试一次，别在断网时只盯着失败的那个死磕。
                     d.logs.push(format!("连接 {} 没有成功，将再次尝试", lp.ssid));
+                    if !st.connected {
+                        self.skip_ssid = Some(lp.ssid.clone());
+                        self.skip_until = now + 15_000;
+                    }
                 }
                 self.last_plan = None;
             }
@@ -323,7 +338,7 @@ impl Decider {
             _ => "Same",
         };
         let prefer24 = s.prefer_band == "2.4G";
-        let mut cands = build_cands(st, &pri, policy);
+        let mut cands = build_cands(st, &pri, policy, s.stale_filter);
         let bad = self.bad.clone();
 
         let is_current = |c: &Cand| -> bool {
@@ -332,7 +347,12 @@ impl Decider {
                 None => false,
             }
         };
-        let is_bad = |c: &Cand| -> bool { is_bad_key(&bad, &c.key(), now) || no_net.as_deref() == Some(c.ssid.as_str()) };
+        let skip: Option<String> = if !st.connected && now < self.skip_until { self.skip_ssid.clone() } else { None };
+        let is_bad = |c: &Cand| -> bool {
+            is_bad_key(&bad, &c.key(), now)
+                || no_net.as_deref() == Some(c.ssid.as_str())
+                || skip.as_deref() == Some(c.ssid.as_str())
+        };
 
         let cur_signal: Option<i64> = cands.iter().filter(|c| is_current(c)).map(|c| c.signal).max();
         let cur_bad = cands.iter().filter(|c| is_current(c)).any(|c| is_bad(c));
@@ -352,7 +372,10 @@ impl Decider {
             if !cur_c && !saved {
                 return false; // 没有已保存配置，无法连接
             }
-            let th = if cur_c || relaxed { s.down_threshold } else { s.up_threshold };
+            let mut th = if cur_c || relaxed { s.down_threshold } else { s.up_threshold };
+            if !cur_c {
+                th = th.max(s.min_connect_signal); // 连接任何新网络都要达到“最低连接信号”
+            }
             c.signal >= th
         };
 
@@ -374,14 +397,14 @@ impl Decider {
                 if !saved && !is_current(c) {
                     return Some("没有已保存的配置文件".to_string());
                 }
-                let th = if relaxed { s.down_threshold } else { s.up_threshold };
+                let mut th = if relaxed { s.down_threshold } else { s.up_threshold };
+                let mut kind = if relaxed { "回落阈值" } else { "升级阈值" };
+                if !is_current(c) && s.min_connect_signal > th {
+                    th = s.min_connect_signal;
+                    kind = "最低连接信号";
+                }
                 if c.signal < th {
-                    return Some(format!(
-                        "信号 {}% 低于{}阈值 {}%",
-                        c.signal,
-                        if relaxed { "回落" } else { "升级" },
-                        th
-                    ));
+                    return Some(format!("信号 {}% 低于{} {}%", c.signal, kind, th));
                 }
                 None
             };

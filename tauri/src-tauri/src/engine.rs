@@ -5,6 +5,7 @@
 //!  - 原生读取失败时自动回退到 netsh 模式（慢，但兼容）。
 
 use crate::decide::{Decider, Plan};
+use crate::freshness::Freshness;
 use crate::model::*;
 use crate::native;
 use crate::netsh;
@@ -90,6 +91,7 @@ struct Engine<H: Host> {
     client: Option<native::Client>,
     native_ok: bool,
     dec: Decider,
+    fresh: Freshness, // 识别缓存里已经消失的接入点
     last_scan_at: i64,
     connecting_seen_at: i64, // 最近一次看到“正在连接”的时间
     scan_busy: bool,
@@ -109,6 +111,7 @@ impl<H: Host> Engine<H> {
             client,
             native_ok,
             dec: Decider::new(),
+            fresh: Freshness::new(now_ms()),
             last_scan_at: -100_000,
             connecting_seen_at: 0,
             scan_busy: false,
@@ -152,6 +155,9 @@ impl<H: Host> Engine<H> {
         if code == 7 || code == 8 {
             self.scan_busy = false; // 扫描完成 / 失败
         }
+        if code == 7 {
+            self.fresh.scan_done(now_ms());
+        }
     }
 
     fn start_scan_if_due(&mut self, s: &Settings) {
@@ -175,15 +181,6 @@ impl<H: Host> Engine<H> {
         let mut ok = false;
         if let Some(c) = &self.client {
             ok = c.scan();
-            // 对排在当前网络前面的优先网络做定向扫描（最多 5 个），更快发现新出现的高优先级网络
-            let cur = self.cur_ssid.lock().ok().and_then(|g| g.clone());
-            let limit = match &cur {
-                Some(cs) => s.priorities.iter().position(|p| p == cs).unwrap_or(s.priorities.len()),
-                None => s.priorities.len(),
-            };
-            for p in s.priorities.iter().take(limit.min(5)) {
-                c.scan_directed(p);
-            }
         }
         // 请求没被接受就不会有“扫描完成”通知，别把 scan_busy 挂着空等
         self.scan_busy = ok;
@@ -217,6 +214,7 @@ impl<H: Host> Engine<H> {
             }
         };
 
+        self.fresh.apply(&mut st, now_ms());
         ensure_current(&mut st);
         if st.connecting {
             self.connecting_seen_at = now_ms();

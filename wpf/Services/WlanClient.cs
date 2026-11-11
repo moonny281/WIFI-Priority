@@ -295,6 +295,7 @@ namespace WifiPriority.Services
                                 net.Bss.Add(new BssInfo
                                 {
                                     Bssid = ReadMac(e, 40),
+                                    HostTs = unchecked((ulong)Marshal.ReadInt64(e, 80)),
                                     Signal = (int)lq,
                                     Rssi = rssi,
                                     Band = BandFromKhz(khz),

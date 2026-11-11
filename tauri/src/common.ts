@@ -6,6 +6,8 @@ export interface Settings {
   Priorities: string[];
   ScanIntervalSec: number;
   UpThreshold: number;
+  MinConnectSignal: number;
+  StaleFilter: boolean;
   DownThreshold: number;
   ConfirmMs: number;
   CooldownSec: number;
