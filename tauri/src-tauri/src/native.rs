@@ -351,6 +351,7 @@ impl Client {
                                 let tsf = rd_u64(p, base + 72);
                                 if tsf != 0 { tsf } else { rd_u64(p, base + 80) }
                             },
+                            changed_at: 0, // 由 Freshness 在每次读取后填写
                             stale: false,
                         });
                     }
