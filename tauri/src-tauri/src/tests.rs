@@ -624,3 +624,175 @@ fn s4_sanitize() {
     assert_eq!(s.band_policy, "Same"); // 非法值回落到“仅同一网络内”（列表顺序绝对优先）
     assert_eq!(s.overlay_opacity, 1.0);
 }
+
+// ---------------- v1.1.8：链路监视 / 快速失败 / 退避 ----------------
+use crate::link::{self, Hw, IfSnapshot, LinkState, Verdict};
+use std::cell::Cell;
+use std::net::Ipv4Addr;
+use std::time::Duration;
+
+struct FakeHw {
+    snap: Cell<IfSnapshot>,
+    gw: Cell<Option<Ipv4Addr>>,
+    ping_ok: Cell<bool>,
+    wan: Cell<bool>,
+}
+
+impl Hw for FakeHw {
+    fn read_if(&self, _g: &[u8; 16]) -> Option<IfSnapshot> {
+        Some(self.snap.get())
+    }
+    fn gateway(&self, _i: u32) -> Option<Ipv4Addr> {
+        self.gw.get()
+    }
+    fn ping(&self, _ip: Ipv4Addr, _ms: u32) -> bool {
+        self.ping_ok.get()
+    }
+    fn wan_ok(&self, _i: u32, _t: Duration) -> bool {
+        self.wan.get()
+    }
+}
+
+fn fake() -> FakeHw {
+    FakeHw {
+        snap: Cell::new(IfSnapshot { if_index: 7, oper_up: true, media_up: true, in_octets: 1000, out_octets: 1000 }),
+        gw: Cell::new(Some(Ipv4Addr::new(192, 168, 1, 1))),
+        ping_ok: Cell::new(true),
+        wan: Cell::new(true),
+    }
+}
+
+const G: [u8; 16] = [0; 16];
+
+#[test]
+fn l1_media_down_is_dead_immediately() {
+    let hw = fake();
+    let s = Settings::fresh();
+    let mut st = LinkState::new("X", 0, 0);
+    let mut sn = hw.snap.get();
+    sn.media_up = false;
+    hw.snap.set(sn);
+    assert!(matches!(link::evaluate(&hw, &mut st, &G, &s, 100), Verdict::LinkDead(_)));
+}
+
+#[test]
+fn l2_dhcp_timeout_replaces_fixed_12s_wait() {
+    let hw = fake();
+    hw.gw.set(None);
+    let s = Settings::fresh(); // ip_wait_ms = 8000
+    let mut st = LinkState::new("X", 0, 0);
+    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 1000), Verdict::Pending);
+    assert!(matches!(link::evaluate(&hw, &mut st, &G, &s, 9000), Verdict::LinkDead(_)));
+}
+
+#[test]
+fn l3_rx_stall_then_gateway_dead_is_detected_in_about_1_5s() {
+    let hw = fake();
+    let s = Settings::fresh(); // stall_ms = 1500
+    let mut st = LinkState::new("X", 0, 0);
+    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 0), Verdict::Healthy); // 网关就绪后立刻验证公网
+    // 之后一直在发包（out 增长），却一个字节都没收到
+    for t in [250, 500, 750, 1000, 1250] {
+        let mut sn = hw.snap.get();
+        sn.out_octets += 1000;
+        hw.snap.set(sn);
+        // 停滞还没到阈值：没有新结论（Pending），但绝不能判死
+        assert!(matches!(link::evaluate(&hw, &mut st, &G, &s, t), Verdict::Pending | Verdict::Healthy), "t={}", t);
+    }
+    let mut sn = hw.snap.get();
+    sn.out_octets += 1000;
+    hw.snap.set(sn);
+    hw.ping_ok.set(false);
+    hw.wan.set(false);
+    assert!(matches!(link::evaluate(&hw, &mut st, &G, &s, 1500), Verdict::LinkDead(_)));
+}
+
+#[test]
+fn l4_gateway_ignores_icmp_but_wan_ok_is_not_dead() {
+    let hw = fake();
+    let s = Settings::fresh();
+    let mut st = LinkState::new("X", 0, 0);
+    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 0), Verdict::Healthy);
+    hw.ping_ok.set(false); // 网关不回 ICMP，但公网通
+    for t in [250, 500, 750, 1000, 1250] {
+        let mut sn = hw.snap.get();
+        sn.out_octets += 1000;
+        hw.snap.set(sn);
+        assert!(matches!(link::evaluate(&hw, &mut st, &G, &s, t), Verdict::Pending | Verdict::Healthy), "t={}", t);
+    }
+    let mut sn = hw.snap.get();
+    sn.out_octets += 1000;
+    hw.snap.set(sn);
+    // 停滞达到阈值：网关 ICMP 不通，但公网通 → 判健康，并记住该网关不回 ICMP
+    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 1500), Verdict::Healthy);
+    assert!(st.gw_no_icmp);
+}
+
+#[test]
+fn l5_wan_down_needs_two_consecutive_failures() {
+    let hw = fake();
+    hw.wan.set(false);
+    let s = Settings::fresh();
+    let mut st = LinkState::new("X", 0, 0);
+    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 0), Verdict::Pending); // 第 1 次失败：还不下结论
+    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 500), Verdict::NoInternet); // 0.5 秒后复测，第 2 次失败
+    hw.wan.set(true); // 恢复
+    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 1000), Verdict::Healthy);
+}
+
+#[test]
+fn l6_backoff_is_exponential_and_capped() {
+    assert_eq!(link::backoff_ms(15, 0), 15_000);
+    assert_eq!(link::backoff_ms(15, 1), 30_000);
+    assert_eq!(link::backoff_ms(15, 2), 60_000);
+    assert_eq!(link::backoff_ms(15, 9), 300_000);
+    assert_eq!(link::backoff_ms(0, 3), 0); // 0 = 关闭退避（等同 v1.1.5 行为）
+}
+
+#[test]
+fn t23_driver_attempt_fail_notification_fails_fast() {
+    let mut d = Decider::new();
+    let s = cfg("Global", "5G", 0, &["A", "B"]);
+    let w = st(Some(("B", 2, 70)), &[("A", 2, 80), ("B", 2, 70)]);
+    assert!(d.decide(&w, &s, 1000, false).connect.is_some());
+    // 驱动在 0.5 秒后就通知“连接请求失败”：不用等满 4 秒
+    d.note_attempt_failed(1500);
+    let r = d.decide(&w, &s, 1600, false);
+    assert!(r.logs.iter().any(|l| l.contains("没有成功")));
+}
+
+#[test]
+fn t24_weak_signal_disconnect_does_not_wait_for_grace() {
+    let s = cfg("Global", "5G", 0, &["A", "B"]);
+    // 掉线前信号已经很弱（< 回落阈值）：系统自己在漫游 / 网络快没了，立刻连下一个
+    let mut d = Decider::new();
+    assert!(d.decide(&st(Some(("B", 2, 30)), &[("B", 2, 30)]), &s, 500, false).connect.is_none());
+    let off = st(None, &[("A", 2, 80)]);
+    assert!(d.decide(&off, &s, 1000, false).connect.is_some());
+    // 掉线前信号很好：仍然给用户手动换网让路 1.2 秒
+    let mut d = Decider::new();
+    assert!(d.decide(&st(Some(("B", 2, 80)), &[("B", 2, 80)]), &s, 500, false).connect.is_none());
+    assert!(d.decide(&off, &s, 1000, false).connect.is_none());
+    assert!(d.decide(&off, &s, 2300, false).connect.is_some());
+}
+
+#[test]
+fn t25_unusable_backoff_blocks_target_then_expires() {
+    let mut d = Decider::new();
+    let s = cfg("Same", "5G", 0, &["Hotspot", "Home"]);
+    d.unusable_handle().lock().unwrap().insert("Hotspot".to_string(), Unusable { until: 10_000, level: 0 });
+    let on_home = st(Some(("Home", 2, 70)), &[("Hotspot", 2, 80), ("Home", 2, 70)]);
+    assert!(d.decide(&on_home, &s, 9000, false).connect.is_none()); // 退避期内：不把它当作切换目标
+    assert_eq!(d.decide(&on_home, &s, 10_500, false).connect.map(|p| p.ssid), Some("Hotspot".to_string())); // 到期立即恢复
+}
+
+#[test]
+fn s7_internet_check_default_on_migration() {
+    let s = Settings::from_json(r#"{"SchemaVersion":3,"InternetCheck":false}"#).unwrap();
+    assert!(s.internet_check);
+    assert_eq!(s.schema_version, CURRENT_SCHEMA);
+    // 新版本里用户自己关掉的，不再被改回来
+    let s = Settings::from_json(r#"{"SchemaVersion":4,"InternetCheck":false}"#).unwrap();
+    assert!(!s.internet_check);
+    assert_eq!(s.disc_grace_ms, 1200);
+}

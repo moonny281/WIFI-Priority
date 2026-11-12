@@ -42,6 +42,10 @@ namespace WifiPriority.Services
         }
 
         const uint SourceAcm = 0x8;
+        const uint SourceMsm = 0x10;
+        /// <summary>ACM 与 MSM 的通知码数值有重叠（如 ACM 7 = 扫描完成，MSM 7 = 无线电状态变化），所以给 MSM 来源的码打标记；ACM 来源保持原值。</summary>
+        public const uint MsmFlag = 0x10000;
+        public const uint AcmConnectionAttemptFail = 11;   // 连接请求失败：驱动毫秒级就会通知，不必再傻等 SettleMs
         const uint ErrAccessDenied = 5;
         const int IfaceInfoSize = 532;   // WLAN_INTERFACE_INFO：GUID(16) + WCHAR[256] + state(4)
         const int AvailNetSize = 628;    // WLAN_AVAILABLE_NETWORK
@@ -74,7 +78,7 @@ namespace WifiPriority.Services
             {
                 if (WlanOpenHandle(2, IntPtr.Zero, out _, out _h) != 0) { _h = IntPtr.Zero; return false; }
                 _cb = OnNotify;
-                WlanRegisterNotification(_h, SourceAcm, false, _cb, IntPtr.Zero, IntPtr.Zero, out _);
+                WlanRegisterNotification(_h, SourceAcm | SourceMsm, false, _cb, IntPtr.Zero, IntPtr.Zero, out _);
                 RefreshInterfaces();
                 return true;
             }
@@ -88,11 +92,15 @@ namespace WifiPriority.Services
                 if (data == IntPtr.Zero) return;
                 uint src = (uint)Marshal.ReadInt32(data, 0);
                 uint code = (uint)Marshal.ReadInt32(data, 4);
-                if (src != SourceAcm) return;
-                Notified?.Invoke(code);
+                uint tagged = src == SourceAcm ? code : src == SourceMsm ? (code | MsmFlag) : uint.MaxValue;
+                if (tagged == uint.MaxValue) return;
+                Notified?.Invoke(tagged);
             }
             catch { }
         }
+
+        /// <summary>第 i 块 WLAN 网卡的 GUID（与网络接口的 Id 相同），供链路监视读取网卡硬件状态与计数器。</summary>
+        public Guid? IfaceGuid(int i) => i >= 0 && i < _ifaces.Count ? _ifaces[i] : (Guid?)null;
 
         void RefreshInterfaces()
         {
@@ -230,6 +238,12 @@ namespace WifiPriority.Services
                         try
                         {
                             int state = Marshal.ReadInt32(data, 0);
+                            // 合理性校验：当前连接结构的偏移不对时（state 超出枚举范围 / 质量 > 100），放弃原生读取
+                            if (state < 0 || state > 7 || (state == 1 && (uint)Marshal.ReadInt32(data, 576) > 100))
+                            {
+                                Broken = true;
+                                return null;
+                            }
                             if (state == 1 && !st.Connected)
                             {
                                 string ssid = ReadSsid(IntPtr.Add(data, 520));

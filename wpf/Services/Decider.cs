@@ -57,7 +57,8 @@ namespace WifiPriority.Services
         long _lastDiagAt = Never;   // 上一次写“为什么没切”诊断日志的时间
         long _lastOrderDiagAt = Never;  // 上一次写“被频段策略排在后面”诊断日志的时间
         long _discAt;               // 本次“未连接”状态开始的时间（0 = 当前不是未连接）
-        const long DiscGraceMs = 1200;  // 刚断开的短暂窗口：用户在 Windows 里手动换网会先断开再开始连接，别抢着发起自己的连接
+        // 刚断开的短暂窗口（AppSettings.DiscGraceMs，默认 1200）：用户在 Windows 里手动换网会先断开再开始连接，别抢着发起自己的连接；
+        // 掉线前信号已经低于回落阈值时不再让路。
         readonly Dictionary<string, long> _bad = new Dictionary<string, long>();   // 仅用于“指定频段失败”（频段级，不是网络级）
         volatile string _noNet;     // 当前连着、但检测不到互联网的 WiFi。一旦离开它就清除，不留冷却
         long _notBefore;            // 系统直接拒绝连接请求后，至少隔 3 秒再试（防止每 250 ms 空转，不是网络冷却）
@@ -65,9 +66,43 @@ namespace WifiPriority.Services
         readonly Dictionary<string, long> _blockAt = new Dictionary<string, long>();
         string _skipSsid;           // 断网状态下刚连失败的网络：15 秒内先试下一个，别在断网时只盯着它死磕（连上任何网络后失效）
         long _skipUntil;
+        // v1.1.8：链路监视确认“不可用”的网络 → 带指数退避的“暂不重试”（until 之前不当作切换目标，之后立即恢复，不是永久拉黑）
+        readonly Dictionary<string, (long Until, int Level)> _unusable = new Dictionary<string, (long Until, int Level)>();
+        long _attemptFailAt;        // 最近一次收到驱动“连接请求失败”通知的时间（0 = 没有）
 
         /// <summary>联网检测报告：当前连着的这个网络无法上网 → 本轮决策把它当作不可用，回退到下一个。</summary>
         public void ReportNoInternet(string ssid) { _noNet = ssid; }
+
+        /// <summary>链路监视确认当前网络不可用：标记为不可用（Decider 立即回落），并写入带指数退避的“暂不重试”表。返回退避毫秒数。</summary>
+        public long ReportUnusable(string ssid, long now, int baseSec)
+        {
+            long wait = Backoff(baseSec, 0);
+            lock (_unusable)
+            {
+                int level = _unusable.TryGetValue(ssid, out var u) ? u.Level + 1 : 0;
+                wait = Backoff(baseSec, level);
+                _unusable[ssid] = (now + wait, level);
+            }
+            _noNet = ssid;
+            return wait;
+        }
+
+        /// <summary>健康满一段时间后清零该网络的退避等级。</summary>
+        public void ClearUnusable(string ssid) { lock (_unusable) _unusable.Remove(ssid); }
+
+        /// <summary>该网络当前的退避等级（0 起；没有记录 = -1），日志用。</summary>
+        public int UnusableLevel(string ssid) { lock (_unusable) return _unusable.TryGetValue(ssid, out var u) ? u.Level : -1; }
+
+        /// <summary>15→30→60→120→240→300 秒；baseSec &lt;= 0 = 关闭退避。</summary>
+        public static long Backoff(int baseSec, int level)
+        {
+            if (baseSec <= 0) return 0;
+            long ms = baseSec * 1000L * (1L << Math.Min(level, 5));
+            return Math.Min(ms, 300000);
+        }
+
+        /// <summary>引擎收到驱动的“连接请求失败”通知（ACM 11）：不再等满 SettleMs，下一轮评估就按失败处理。</summary>
+        public void NoteAttemptFailed(long now) { _attemptFailAt = Math.Max(now, 1); }
         public void ClearNoInternet(string ssid) { if (_noNet == ssid) _noNet = null; }
         public bool IsNoInternet(string ssid) => _noNet == ssid;
 
@@ -154,6 +189,8 @@ namespace WifiPriority.Services
             string cur = st.Connected ? st.Ssid : null;
 
             // 1) 上一次连接请求的结果（不阻塞：每次评估时顺带检查）
+            // 驱动已经通知“连接请求失败”（且发生在我们发出请求之后）：不用再等满 SettleMs
+            bool failedFast = _attemptFailAt != 0 && _attemptFailAt >= _lastPlanAt;
             if (_lastPlan != null)
             {
                 bool onTarget = st.Connected && st.Ssid == _lastPlan.Ssid;
@@ -163,7 +200,7 @@ namespace WifiPriority.Services
                 {
                     _lastPlan = null;                                   // 成功
                 }
-                else if (el >= SettleMs && !st.Connecting)
+                else if ((el >= SettleMs || failedFast) && !st.Connecting)
                 {
                     if (!onTarget && _lastPlan.Bssid != null && !_lastPlan.Retried)
                     {
@@ -232,7 +269,9 @@ namespace WifiPriority.Services
 
             // 刚断开（<1.2 秒）：可能是用户在 Windows 里手动换网（先断开再开始连接），也可能是系统自己在重连。
             // 这时抢着发起连接会把对方的连接打断，表现为“无法连接网络”。先等一下，看对方是否开始连接。
-            if (!st.Connected && now - _discAt < DiscGraceMs) return d;
+            // 信号本来就很弱（系统自己在漫游 / 网络已经快没了）时不再让路，立刻连下一个
+            long grace = _prevSignal < s.DownThreshold ? 0 : s.DiscGraceMs;
+            if (!st.Connected && now - _discAt < grace) return d;
             if (now < _notBefore) return d;
 
             var pri = s.Priorities.ToList();
@@ -251,12 +290,17 @@ namespace WifiPriority.Services
                 if (c.SeenAt < 0) return now - blockedAt < 20000;    // 驱动没给时间戳，无法求证：退化为 20 秒间隔
                 return true;                                 // 0 = 启动时缓存里的、从未观察到更新：不算证据
             }
-            bool IsBad(Cand c) => IsBadKey(c.Key, now) || (_noNet != null && c.Ssid == _noNet) || Blocked(c)
+            Dictionary<string, (long Until, int Level)> unusable;
+            lock (_unusable) unusable = new Dictionary<string, (long Until, int Level)>(_unusable);
+            // 判死过的网络：退避期内不当作切换目标（当前连着的由 _noNet 负责）
+            bool InBackoff(Cand c) => !IsCurrent(c) && unusable.TryGetValue(c.Ssid, out var u) && u.Until > now;
+            bool IsBad(Cand c) => IsBadKey(c.Key, now) || (_noNet != null && c.Ssid == _noNet) || Blocked(c) || InBackoff(c)
                 || (cur == null && _skipSsid != null && c.Ssid == _skipSsid && now < _skipUntil);
 
             var curCand = cands.Where(IsCurrent).OrderByDescending(c => c.Signal).FirstOrDefault();
             bool curListed = cur != null && pri.Contains(cur);
-            bool curOk = curCand != null && !IsBad(curCand) && curCand.Signal >= s.DownThreshold;
+            bool curBad = curCand != null && IsBad(curCand);
+            bool curOk = curCand != null && !curBad && curCand.Signal >= s.DownThreshold;
 
             // 未连接，或当前（列表内）网络已经不行了：只要求候选 >= 回落阈值，避免卡在烂信号上
             bool relaxed = cur == null || (curListed && !curOk);
@@ -336,6 +380,7 @@ namespace WifiPriority.Services
             string reason = cur == null ? "当前未连接"
                 : !curListed ? "当前网络不在优先级列表中"
                 : curOk ? (sameSsid ? $"同一网络有更优频段（{Wifi.BandName(best.Band)}）" : "出现更高优先级网络")
+                : curBad ? "当前网络不可用（无法上网/链路无响应），回落到次优先级"
                 : (sameSsid ? "当前频段信号丢失或过弱，回落到另一频段" : "当前网络信号丢失或过弱，回落到次优先级");
 
             // 4) 防抖：未连接时立刻连；否则候选必须持续最优 ConfirmMs 毫秒，升级还要过冷却时间

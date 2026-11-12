@@ -12,7 +12,6 @@ use std::sync::{Arc, Mutex};
 
 const NEVER: i64 = i64::MIN / 4;
 const SETTLE_MS: i64 = 4000; // 发出连接请求后，最多等这么久看结果
-const DISC_GRACE_MS: i64 = 1200; // 刚断开的短暂窗口：别抢着打断用户手动发起的连接
 
 #[derive(Clone, Debug)]
 pub struct Plan {
@@ -41,6 +40,14 @@ pub struct Decision {
 }
 
 pub type BadMap = Arc<Mutex<HashMap<String, i64>>>;
+
+/// 链路监视线程多层证据确认“不可用”的网络：until 之前不参与选择（指数退避），之后立即恢复，不是永久拉黑。
+#[derive(Clone, Debug)]
+pub struct Unusable {
+    pub until: i64,
+    pub level: u32,
+}
+pub type UnusableMap = Arc<Mutex<HashMap<String, Unusable>>>;
 
 struct Cand {
     ssid: String,
@@ -77,6 +84,8 @@ pub struct Decider {
     skip_ssid: Option<String>, // 断网状态下刚连失败的网络：15 秒内先试下一个，别在断网时只盯着它死磕
     skip_until: i64,
     no_net: Arc<Mutex<Option<String>>>, // 当前连着、但检测不到互联网的 WiFi。离开它就清除，不留冷却
+    unusable: UnusableMap, // 带退避的“暂不重试”表（链路监视线程写入）
+    attempt_fail_at: i64,  // 最近一次收到驱动“连接请求失败”通知的时间（0 = 没有）
     bad: BadMap,
 }
 
@@ -189,6 +198,8 @@ impl Decider {
             skip_ssid: None,
             skip_until: 0,
             no_net: Arc::new(Mutex::new(None)),
+            unusable: Arc::new(Mutex::new(HashMap::new())),
+            attempt_fail_at: 0,
             bad: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -201,6 +212,16 @@ impl Decider {
     /// 联网检测线程用它报告/清除“当前网络无法上网”。
     pub fn no_net_handle(&self) -> Arc<Mutex<Option<String>>> {
         self.no_net.clone()
+    }
+
+    /// 链路监视线程用它写入/清除“暂不重试”的退避表。
+    pub fn unusable_handle(&self) -> UnusableMap {
+        self.unusable.clone()
+    }
+
+    /// 引擎收到驱动的“连接请求失败”通知（ACM 11）：不再等满 SETTLE_MS，下一轮评估就按失败处理。
+    pub fn note_attempt_failed(&mut self, now: i64) {
+        self.attempt_fail_at = now.max(1);
     }
 
     pub fn report_no_internet(&self, ssid: &str) {
@@ -252,13 +273,15 @@ impl Decider {
         let cur: Option<&str> = if st.connected { Some(st.ssid.as_str()) } else { None };
 
         // 1) 上一次连接请求的结果（不阻塞：每次评估时顺带检查）
+        // 驱动已经通知“连接请求失败”（且发生在我们发出请求之后）：不用再等满 SETTLE_MS
+        let failed_fast = self.attempt_fail_at != 0 && self.attempt_fail_at >= self.last_plan_at;
         if let Some(lp) = self.last_plan.clone() {
             let on_target = st.connected && st.ssid == lp.ssid;
             let band_ok = lp.band == 0 || st.cur_band == 0 || st.cur_band == lp.band;
             let el = now - self.last_plan_at;
             if on_target && band_ok && !st.connecting {
                 self.last_plan = None; // 成功
-            } else if el >= SETTLE_MS && !st.connecting {
+            } else if (el >= SETTLE_MS || failed_fast) && !st.connecting {
                 if !on_target && lp.bssid.is_some() && !lp.retried {
                     // 指定接入点（BSSID）没连上：BSS 列表是缓存，那个接入点可能已经不在了。
                     // 先退一步只按配置文件重试一次，再决定要不要拉黑。
@@ -338,7 +361,9 @@ impl Decider {
 
         // 刚断开（<1.2 秒）：可能是用户在 Windows 里手动换网（先断开再开始连接），也可能是系统自己在重连。
         // 这时抢着发起连接会把对方的连接打断，表现为“无法连接网络”。先等一下，看对方是否开始连接。
-        if !st.connected && now - self.disc_at < DISC_GRACE_MS {
+        // 信号本来就很弱（系统自己在漫游 / 网络已经快没了）时不再让路，立刻连下一个。
+        let grace = if self.prev_signal < s.down_threshold { 0 } else { s.disc_grace_ms };
+        if !st.connected && now - self.disc_at < grace {
             return d;
         }
         if now < self.not_before {
@@ -377,10 +402,12 @@ impl Decider {
             }
         };
         let skip: Option<String> = if !st.connected && now < self.skip_until { self.skip_ssid.clone() } else { None };
+        let unusable = self.unusable.lock().unwrap().clone();
         let is_bad = |c: &Cand| -> bool {
             is_bad_key(&bad, &c.key(), now)
                 || no_net.as_deref() == Some(c.ssid.as_str())
                 || skip.as_deref() == Some(c.ssid.as_str())
+                || (!is_current(c) && unusable.get(&c.ssid).map_or(false, |u| u.until > now)) // 判死过的网络：退避期内不当作切换目标（当前连着的由 no_net 负责）
                 || blocked(c)
         };
 
@@ -490,6 +517,8 @@ impl Decider {
             } else {
                 "出现更高优先级网络".to_string()
             }
+        } else if cur_bad {
+            "当前网络不可用（无法上网/链路无响应），回落到次优先级".to_string()
         } else if same_ssid {
             "当前频段信号丢失或过弱，回落到另一频段".to_string()
         } else {

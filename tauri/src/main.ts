@@ -139,7 +139,11 @@ const TEMPLATE = `
         <div class="setting"><span>两次“升级”切换的最短间隔（秒；信号丢失时的回落不受限制）</span><input type="number" min="0" max="3600" data-setting="CooldownSec" /></div>
         <div class="setting"><span>检测到手动换网后暂停自动切换（分钟，0 = 不暂停）</span><input type="number" min="0" max="1440" data-setting="ManualPauseMinutes" /></div>
         <label class="switch mt16"><input type="checkbox" data-setting="TakeoverUnlisted" /><span>当前连接的网络不在优先级列表里时，也自动切到列表中的网络</span></label>
-        <label class="switch"><input type="checkbox" data-setting="InternetCheck" /><span>联网检测：连上 12 秒后仍连续检测不到互联网时，回落到下一个网络</span></label>
+        <label class="switch"><input type="checkbox" data-setting="InternetCheck" /><span>联网检测：网卡硬件链路 + 网关 + 公网分层检测，当前网络用不了时秒级回落到下一个网络</span></label>
+        <div class="setting"><span>联网检测：入站流量停滞多久算“怀疑”并发起网关探测（毫秒）</span><input type="number" min="500" max="10000" data-setting="StallMs" /></div>
+        <div class="setting"><span>联网检测：网络健康时，公网探测的间隔（秒）</span><input type="number" min="2" max="120" data-setting="WanIntervalSec" /></div>
+        <div class="setting"><span>联网检测：判定不可用后，多少秒内不再把它当作切换目标（指数退避的基数，0 = 关闭退避）</span><input type="number" min="0" max="600" data-setting="UnusableBackoffSec" /></div>
+        <div class="setting"><span>联网检测：刚连上后等待 DHCP/网关就绪的上限（毫秒）</span><input type="number" min="2000" max="30000" data-setting="IpWaitMs" /></div>
         <label class="switch"><input type="checkbox" data-setting="StaleFilter" /><span>忽略已经消失的网络：Windows 会把关掉的热点在缓存里留一阵子，开启后不再去连它（推荐）</span></label>
         <label class="switch"><input type="checkbox" data-setting="Notify" /><span>切换时弹出系统通知</span></label>
       </div>

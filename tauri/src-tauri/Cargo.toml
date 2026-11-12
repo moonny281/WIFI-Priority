@@ -1,6 +1,6 @@
 [package]
 name = "wifi-priority"
-version = "1.1.7"
+version = "1.1.8"
 description = "按优先级自动切换 WiFi，5G 优先，毫秒级响应"
 edition = "2021"
 
@@ -16,6 +16,15 @@ serde_json = "1"
 regex = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 encoding_rs = "0.8"
+socket2 = "0.5"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
 
 [profile.release]
 panic = "abort"

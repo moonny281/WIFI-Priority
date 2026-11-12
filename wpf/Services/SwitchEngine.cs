@@ -34,6 +34,11 @@ namespace WifiPriority.Services
         long _lastPublishAt;
         volatile string _curSsid;
         long _connectingSeenAt;   // 最近一次看到“正在连接”的时间
+        LinkMonitor _link;        // v1.1.8 链路健康检测（原生模式）
+        volatile CurLink _curLink;
+        string _connKey = "";     // ssid|bssid：变了就算“新的一次连接”
+        long _connAt;
+        volatile bool _urgentScan;   // 链路监视判死当前网络后置位：下一轮无视扫描间隔立即扫描
 
         public volatile bool ManualPause;
         public bool Paused => ManualPause || DateTime.Now < _pausedUntil;
@@ -60,10 +65,30 @@ namespace WifiPriority.Services
             }
             else Log?.Invoke("无法打开原生 WLAN 接口，使用 netsh 兼容模式（切换较慢）");
 
+            if (SettingsStore.InternetCheckMigrated)
+                Log?.Invoke("v1.1.8：联网检测已默认开启（硬件链路读数 + 网关 + 公网分层检测，不会再把刚连上的热点误判成“无法上网”）。不想要可在 设置 里关闭");
+
+            _link = new LinkMonitor(_s)
+            {
+                GetCurrent = () => _curLink,
+                ReportUnusable = (ssid, why, took) =>
+                {
+                    long wait = _dec.ReportUnusable(ssid, Now, _s.UnusableBackoffSec);
+                    int lvl = _dec.UnusableLevel(ssid);
+                    _urgentScan = true;   // 立刻扫描，别等 ScanIntervalSec
+                    Log?.Invoke($"{ssid} 不可用：{why}（{took}），回落到下一个网络；"
+                        + (wait > 0 ? $"{wait / 1000} 秒内不会再把它当作切换目标（第 {lvl + 1} 次）" : "未启用退避，它重新成为最优时会再次尝试"));
+                    TriggerNow();
+                },
+                ReportHealthy = ssid => _dec.ClearNoInternet(ssid),
+                ClearBackoff = ssid => _dec.ClearUnusable(ssid),
+            };
+
             _cts = new CancellationTokenSource();
             var token = _cts.Token;
             Task.Run(() => LoopAsync(token));
-            Task.Run(() => InternetLoopAsync(token));
+            Task.Run(() => _link.RunAsync(token));
+            Task.Run(() => InternetLoopAsync(token));   // 旧的联网检测只在 netsh 兼容模式（拿不到网卡 GUID）下工作
         }
 
         public void Stop()
@@ -76,6 +101,8 @@ namespace WifiPriority.Services
         {
             if (code == 7 || code == 8) _scanBusy = false;   // 扫描完成 / 失败
             if (code == 7) _fresh.ScanDone(Now);
+            if (code == WlanClient.AcmConnectionAttemptFail) _dec.NoteAttemptFailed(Now);   // 驱动已经明确告知“连接请求失败”：不再傻等 SettleMs
+            _link?.Wake();                                                                    // ACM / MSM 事件都叫醒链路监视
             TriggerNow();
         }
 
@@ -108,10 +135,13 @@ namespace WifiPriority.Services
         void StartScanIfDue(long now)
         {
             long gap = _s.ScanIntervalSec <= 0 ? 400 : _s.ScanIntervalSec * 1000L;
-            if (now - _lastScanAt < gap) return;
+            // 链路监视判死当前网络后置位：此时当前连接已经是死的，立刻扫描，不受扫描间隔与“正在连接”保护限制
+            bool urgent = _urgentScan;
+            _urgentScan = false;
+            if (!urgent && now - _lastScanAt < gap) return;
             // 正在连接时不扫描：用户在 Windows 里手动连、或我们自己刚发出的连接请求。
             // 有些网卡驱动在关联过程中被扫描打断会直接报“无法连接网络”（手机热点响应慢，更容易中招）。
-            if (_connectingSeenAt != 0 && now - _connectingSeenAt < 2000) return;
+            if (!urgent && _connectingSeenAt != 0 && now - _connectingSeenAt < 2000) return;
             if (_dec.ActiveTarget != null) return;
             if (_scanBusy && now - _lastScanAt < 6000) return;      // 上一次扫描还没完成
             _lastScanAt = now;
@@ -167,6 +197,12 @@ namespace WifiPriority.Services
             _curSsid = st.Connected ? st.Ssid : null;
             if (st.Connecting) _connectingSeenAt = Now;
 
+            // 发布“当前连接”给链路监视（SSID 或 BSSID 变了就算新的一次连接，重新计时等 DHCP）
+            string key = (st.Ssid ?? "") + "|" + (st.CurBssid ?? "");
+            if (st.Connected && key != _connKey) { _connKey = key; _connAt = Now; }
+            Guid? ifg = st.Connected && st.Fast ? _wlan.IfaceGuid(st.CurIface) : null;
+            _curLink = ifg.HasValue ? new CurLink { Ssid = st.Ssid, IfGuid = ifg.Value, ConnectedAt = _connAt } : null;
+
             var dec = _dec.Decide(st, _s, Now, Paused);
             foreach (var l in dec.Logs) Log?.Invoke(l);
             if (dec.PauseMinutes > 0) _pausedUntil = DateTime.Now.AddMinutes(dec.PauseMinutes);
@@ -205,7 +241,8 @@ namespace WifiPriority.Services
             {
                 try { await Task.Delay(3000, ct); } catch (OperationCanceledException) { break; }
                 string cur = _curSsid;
-                if (!_s.InternetCheck || cur == null) { fail = 0; last = null; continue; }
+                // 原生模式下由 LinkMonitor 负责（硬件读数 + 绑定网卡的探测），这里只在 netsh 兼容模式下工作
+                if (_native || !_s.InternetCheck || cur == null) { fail = 0; last = null; continue; }
 
                 // 刚连上（DHCP 还没完成、路由还没通）的 12 秒内不检测，避免把正在握手的热点误判成“无法上网”
                 if (cur != last) { last = cur; since = Now; fail = 0; continue; }

@@ -345,8 +345,24 @@
 
                             <CheckBox x:Name="SwTakeover" Content="当前连接的网络不在优先级列表里时，也自动切到列表中的网络"
                                       Style="{StaticResource Switch}" Margin="0,16,0,0" Click="Settings_Changed"/>
-                            <CheckBox x:Name="SwInternet" Content="联网检测：连上 12 秒后仍连续检测不到互联网时，回落到下一个网络"
+                            <CheckBox x:Name="SwInternet" Content="联网检测：网卡硬件链路 + 网关 + 公网分层检测，当前网络用不了时秒级回落到下一个网络"
                                       Style="{StaticResource Switch}" Margin="0,12,0,0" Click="Settings_Changed"/>
+                            <Grid Margin="0,6">
+                                <TextBlock Text="联网检测：入站流量停滞多久算“怀疑”并发起网关探测（毫秒）" VerticalAlignment="Center"/>
+                                <TextBox x:Name="TbStallMs" Width="84" HorizontalAlignment="Right" TextAlignment="Right" LostFocus="Settings_Changed"/>
+                            </Grid>
+                            <Grid Margin="0,6">
+                                <TextBlock Text="联网检测：网络健康时，公网探测的间隔（秒）" VerticalAlignment="Center"/>
+                                <TextBox x:Name="TbWanInterval" Width="84" HorizontalAlignment="Right" TextAlignment="Right" LostFocus="Settings_Changed"/>
+                            </Grid>
+                            <Grid Margin="0,6">
+                                <TextBlock Text="联网检测：判定不可用后，多少秒内不再把它当作切换目标（指数退避的基数，0 = 关闭退避）" VerticalAlignment="Center"/>
+                                <TextBox x:Name="TbBackoff" Width="84" HorizontalAlignment="Right" TextAlignment="Right" LostFocus="Settings_Changed"/>
+                            </Grid>
+                            <Grid Margin="0,6">
+                                <TextBlock Text="联网检测：刚连上后等待 DHCP/网关就绪的上限（毫秒）" VerticalAlignment="Center"/>
+                                <TextBox x:Name="TbIpWait" Width="84" HorizontalAlignment="Right" TextAlignment="Right" LostFocus="Settings_Changed"/>
+                            </Grid>
                             <CheckBox x:Name="SwStale" Content="忽略已经消失的网络：Windows 会把关掉的热点在缓存里留一阵子，开启后不再去连它（推荐）"
                                       Style="{StaticResource Switch}" Margin="0,12,0,0" Click="Settings_Changed"/>
                             <CheckBox x:Name="SwNotify" Content="切换时弹出系统通知"

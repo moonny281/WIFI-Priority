@@ -15,6 +15,7 @@ pub struct Shared {
     pub paused_until: AtomicI64, // unix 秒，0 = 无
     pub wake: Mutex<Option<Sender<u32>>>,
     pub native_mode: AtomicBool,
+    pub urgent_scan: AtomicBool, // 链路监视线程判死当前网络后置位：引擎下一轮无视扫描间隔立即扫描
     pub mica: AtomicBool,
     pub settings_dirty: AtomicBool, // 悬浮框被拖动等“后台改了设置”的情况，由保存线程落盘并通知前端
     pub overlay_target: Mutex<Option<(i32, i32)>>, // 程序最近一次设置的悬浮框位置（物理像素），用来区分“用户拖动”
@@ -31,6 +32,7 @@ impl Shared {
             paused_until: AtomicI64::new(0),
             wake: Mutex::new(None),
             native_mode: AtomicBool::new(false),
+            urgent_scan: AtomicBool::new(false),
             mica: AtomicBool::new(false),
             settings_dirty: AtomicBool::new(false),
             overlay_target: Mutex::new(None),

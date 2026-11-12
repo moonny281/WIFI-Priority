@@ -6,6 +6,7 @@ mod commands;
 mod decide;
 mod engine;
 mod freshness;
+mod link;
 mod model;
 mod native;
 mod netsh;

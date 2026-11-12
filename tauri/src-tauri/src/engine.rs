@@ -6,6 +6,7 @@
 
 use crate::decide::{Decider, Plan};
 use crate::freshness::Freshness;
+use crate::link::{self, CurLink};
 use crate::model::*;
 use crate::native;
 use crate::netsh;
@@ -97,13 +98,19 @@ struct Engine<H: Host> {
     scan_busy: bool,
     last_sig: String,
     last_pub_at: i64,
-    cur_ssid: Arc<Mutex<Option<String>>>,
+    cur_ssid: Arc<Mutex<Option<String>>>, // 仅 netsh 兼容模式的旧联网检测使用
+    cur_link: Arc<Mutex<Option<CurLink>>>, // 发布给链路监视线程：当前连接的 SSID / 网卡 GUID / 连接开始时间
+    mon_tx: mpsc::Sender<u32>,             // 把 WLAN 通知转发给链路监视线程，让它立即跑一轮
+    mon_rx: Option<mpsc::Receiver<u32>>,
+    conn_key: (String, String), // (ssid, bssid)：变了就算“新的一次连接”
+    conn_at: i64,
 }
 
 impl<H: Host> Engine<H> {
     fn new(host: Arc<H>, sh: Arc<Shared>, tx: mpsc::Sender<u32>) -> Engine<H> {
         let client = native::Client::open(tx);
         let native_ok = client.is_some();
+        let (mon_tx, mon_rx) = mpsc::channel::<u32>();
         sh.native_mode.store(native_ok, std::sync::atomic::Ordering::Relaxed);
         Engine {
             host,
@@ -118,6 +125,11 @@ impl<H: Host> Engine<H> {
             last_sig: String::new(),
             last_pub_at: 0,
             cur_ssid: Arc::new(Mutex::new(None)),
+            cur_link: Arc::new(Mutex::new(None)),
+            mon_tx,
+            mon_rx: Some(mon_rx),
+            conn_key: (String::new(), String::new()),
+            conn_at: 0,
         }
     }
 
@@ -134,6 +146,22 @@ impl<H: Host> Engine<H> {
         if BAND_POLICY_MIGRATED.load(std::sync::atomic::Ordering::SeqCst) {
             self.log("v1.1.3：频段策略已由“全局偏好频段优先”改为“仅同一网络内”（列表顺序绝对优先）——旧策略会让当前的 5G 网络排在列表更靠前的 2.4G 网络之前，导致更高优先级的网络出现时不切换。想恢复可在 设置 → 频段偏好 里改回");
         }
+        if INTERNET_CHECK_MIGRATED.load(std::sync::atomic::Ordering::SeqCst) {
+            self.log("v1.1.8：联网检测已默认开启（硬件链路读数 + 网关 + 公网分层检测，不会再把刚连上的热点误判成“无法上网”）。不想要可在 设置 里关闭");
+        }
+        // 链路监视线程（v1.1.8）：网卡硬件读数 + 绑定网卡的分层探测，判死后秒级回落
+        if let Some(rx) = self.mon_rx.take() {
+            let (host, sh) = (self.host.clone(), self.sh.clone());
+            link::spawn_monitor(
+                self.sh.clone(),
+                self.cur_link.clone(),
+                self.dec.no_net_handle(),
+                self.dec.unusable_handle(),
+                rx,
+                move |m| log_line(&host, &sh, m),
+            );
+        }
+        // 旧的联网检测线程只在 netsh 兼容模式（拿不到网卡 GUID）下工作
         self.spawn_internet_monitor();
 
         loop {
@@ -158,17 +186,24 @@ impl<H: Host> Engine<H> {
         if code == 7 {
             self.fresh.scan_done(now_ms());
         }
+        if code == native::ACM_CONNECTION_ATTEMPT_FAIL {
+            // 驱动已经明确告知“连接请求失败”：不再傻等 SETTLE_MS
+            self.dec.note_attempt_failed(now_ms());
+        }
+        let _ = self.mon_tx.send(code); // ACM / MSM 事件都叫醒链路监视线程
     }
 
     fn start_scan_if_due(&mut self, s: &Settings) {
         let now = now_ms();
         let gap = if s.scan_interval_sec <= 0 { 400 } else { s.scan_interval_sec * 1000 };
-        if now - self.last_scan_at < gap {
+        // 链路监视线程判死当前网络后置位：此时当前连接已经是死的，立刻扫描，不受扫描间隔与“正在连接”保护限制
+        let urgent = self.sh.urgent_scan.swap(false, std::sync::atomic::Ordering::Relaxed);
+        if !urgent && now - self.last_scan_at < gap {
             return;
         }
         // 正在连接时不扫描：用户在 Windows 里手动连、或我们自己刚发出的连接请求。
         // 有些网卡驱动在关联过程中被扫描打断会直接报“无法连接网络”（手机热点响应慢，更容易中招）。
-        if self.connecting_seen_at != 0 && now - self.connecting_seen_at < 2000 {
+        if !urgent && self.connecting_seen_at != 0 && now - self.connecting_seen_at < 2000 {
             return;
         }
         if self.dec.active_target().is_some() {
@@ -221,6 +256,22 @@ impl<H: Host> Engine<H> {
         }
         if let Ok(mut g) = self.cur_ssid.lock() {
             *g = if st.connected { Some(st.ssid.clone()) } else { None };
+        }
+        // 发布“当前连接”给链路监视线程（SSID 或 BSSID 变了就算新的一次连接，重新计时等 DHCP）
+        let key = (st.ssid.clone(), st.cur_bssid.clone().unwrap_or_default());
+        if st.connected && key != self.conn_key {
+            self.conn_key = key;
+            self.conn_at = now_ms();
+        }
+        if let Ok(mut g) = self.cur_link.lock() {
+            *g = if st.connected && st.fast {
+                self.client
+                    .as_ref()
+                    .and_then(|c| c.iface_guid(st.cur_iface))
+                    .map(|guid| CurLink { ssid: st.ssid.clone(), guid, connected_at: self.conn_at })
+            } else {
+                None
+            };
         }
 
         let dec = self.dec.decide(&st, &s, now_ms(), self.sh.is_paused());
@@ -285,7 +336,7 @@ impl<H: Host> Engine<H> {
         }
     }
 
-    // ---------- 联网检测（独立后台线程，不阻塞切换） ----------
+    // ---------- 旧的联网检测（仅 netsh 兼容模式的降级路径；原生模式见 link.rs） ----------
     // 只用来决定“刚连上的网络能不能上网，不能就回退”。不做任何冷却：离开那个网络后不留记忆，
     // 它还在、还是最优，就会再次连接。
     fn spawn_internet_monitor(&self) {
@@ -301,7 +352,9 @@ impl<H: Host> Engine<H> {
                 std::thread::sleep(Duration::from_secs(3));
                 let enabled = sh.settings.lock().map(|s| s.internet_check).unwrap_or(false);
                 let ssid = cur.lock().ok().and_then(|g| g.clone());
-                let ssid = match (enabled, ssid) {
+                // 原生模式下由链路监视线程负责（硬件读数 + 绑定网卡的探测），这里只在 netsh 兼容模式下工作
+                let native = sh.native_mode.load(std::sync::atomic::Ordering::Relaxed);
+                let ssid = match (enabled && !native, ssid) {
                     (true, Some(s)) => s,
                     _ => {
                         fail = 0;

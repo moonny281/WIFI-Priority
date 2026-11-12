@@ -81,6 +81,7 @@ namespace WifiPriority
 
             Engine = new SwitchEngine(Settings);
             Engine.Log += m => Log(m);
+            if (SettingsStore.InternetCheckMigrated) SettingsStore.Save(Settings);   // v1.1.8：联网检测默认开启，把迁移结果落盘
             if (SettingsStore.BandPolicyMigrated)
             {
                 SettingsStore.Save(Settings);

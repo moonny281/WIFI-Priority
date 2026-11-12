@@ -14,6 +14,13 @@ export interface Settings {
   ManualPauseMinutes: number;
   TakeoverUnlisted: boolean;
   InternetCheck: boolean;
+  StallMs: number;
+  HeartbeatMs: number;
+  WanIntervalSec: number;
+  WanTimeoutMs: number;
+  IpWaitMs: number;
+  UnusableBackoffSec: number;
+  DiscGraceMs: number;
   Notify: boolean;
   BandPolicy: 'Off' | 'Same' | 'Global';
   PreferBand: '5G' | '2.4G';

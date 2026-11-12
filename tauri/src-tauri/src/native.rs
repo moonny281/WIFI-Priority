@@ -47,6 +47,17 @@ extern "system" {
 }
 
 const SOURCE_ACM: u32 = 0x8;
+const SOURCE_MSM: u32 = 0x10;
+/// ACM 与 MSM 的通知码数值有重叠（如 ACM 7 = 扫描完成，MSM 7 = 无线电状态变化），所以给 MSM 来源的码打标记；
+/// ACM 来源的码保持原值，引擎里现有的 note(7/8) 逻辑不受影响。
+pub const MSM_FLAG: u32 = 0x1_0000;
+pub const ACM_CONNECTION_ATTEMPT_FAIL: u32 = 11; // 连接请求失败：驱动毫秒级就会通知，不必再傻等 SETTLE_MS
+#[allow(dead_code)]
+pub const MSM_DISASSOCIATING: u32 = 9 | MSM_FLAG;
+#[allow(dead_code)]
+pub const MSM_DISCONNECTED: u32 = 10 | MSM_FLAG;
+#[allow(dead_code)]
+pub const MSM_SIGNAL_QUALITY: u32 = 8 | MSM_FLAG;
 const ERR_ACCESS_DENIED: u32 = 5;
 const IFACE_INFO_SIZE: usize = 532; // WLAN_INTERFACE_INFO：GUID(16) + WCHAR[256] + state(4)
 const AVAIL_NET_SIZE: usize = 628; // WLAN_AVAILABLE_NETWORK
@@ -63,12 +74,14 @@ unsafe extern "system" fn on_notify(data: *mut c_void, _ctx: *mut c_void) {
     let p = data as *const u8;
     let src = read_unaligned(p as *const u32);
     let code = read_unaligned(p.add(4) as *const u32);
-    if src != SOURCE_ACM {
-        return;
-    }
+    let tagged = match src {
+        SOURCE_ACM => code,
+        SOURCE_MSM => code | MSM_FLAG,
+        _ => return,
+    };
     if let Ok(g) = NOTIFY_TX.lock() {
         if let Some(tx) = g.as_ref() {
-            let _ = tx.send(code);
+            let _ = tx.send(tagged);
         }
     }
 }
@@ -153,7 +166,7 @@ impl Client {
                 *g = Some(tx);
             }
             let mut prev = 0u32;
-            WlanRegisterNotification(h, SOURCE_ACM, 0, Some(on_notify), null_mut(), null_mut(), &mut prev);
+            WlanRegisterNotification(h, SOURCE_ACM | SOURCE_MSM, 0, Some(on_notify), null_mut(), null_mut(), &mut prev);
             let mut c = Client {
                 h,
                 ifaces: Vec::new(),
@@ -184,6 +197,33 @@ impl Client {
             }
             self.ifaces = fresh;
             WlanFreeMemory(list);
+        }
+    }
+
+    /// 第 i 块 WLAN 网卡的 GUID（与 IP Helper 的接口 GUID 相同），供链路监视线程读网卡硬件计数器。
+    pub fn iface_guid(&self, i: i32) -> Option<[u8; 16]> {
+        if i < 0 {
+            return None;
+        }
+        self.ifaces.get(i as usize).copied()
+    }
+
+    /// 驱动实时上报的 RSSI（dBm）：opcode = wlan_intf_opcode_rssi (0x10000102)，仅已连接时有值。
+    /// 可选的诊断 / “怀疑”信号，目前仅供日后扩展。
+    #[allow(dead_code)]
+    pub fn rssi_dbm(&self, idx: usize) -> Option<i32> {
+        const OPCODE_RSSI: i32 = 0x1000_0102;
+        let g = self.ifaces.get(idx)?;
+        unsafe {
+            let mut data: *mut c_void = null_mut();
+            let mut size = 0u32;
+            let r = WlanQueryInterface(self.h, g.as_ptr(), OPCODE_RSSI, null_mut(), &mut size, &mut data, null_mut());
+            if r != 0 || data.is_null() {
+                return None;
+            }
+            let v = if size >= 4 { Some(rd_i32(data as *const u8, 0)) } else { None };
+            WlanFreeMemory(data);
+            v
         }
     }
 
@@ -270,6 +310,12 @@ impl Client {
                 } else if r == 0 && !data.is_null() {
                     let p = data as *const u8;
                     let state = rd_i32(p, 0);
+                    // 合理性校验：当前连接结构的偏移不对时（state 超出枚举范围 / 质量 > 100），放弃原生读取
+                    if !(0..=7).contains(&state) || (state == 1 && rd_u32(p, 576) > 100) {
+                        WlanFreeMemory(data);
+                        self.broken = true;
+                        return None;
+                    }
                     if state == 1 && !st.connected {
                         if let Some(ssid) = ssid_at(p, 520) {
                             st.connected = true;

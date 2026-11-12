@@ -18,7 +18,15 @@ namespace WifiPriority.Models
         public int CooldownSec { get; set; } = 8;         // 两次“升级”切换之间的最短间隔
         public int ManualPauseMinutes { get; set; } = 10; // 检测到手动切换后暂停自动切换的分钟数，0 = 不暂停
         public bool TakeoverUnlisted { get; set; } = true; // 当前连接的网络不在列表中时，是否也切到列表中的网络
-        public bool InternetCheck { get; set; } = false;   // 连上但无法上网时视为不可用
+        public bool InternetCheck { get; set; } = true;    // 联网检测：链路/网关/公网不可用时视为不可用（v1.1.8 起默认开启）
+        // v1.1.8 链路健康检测（硬件读数 + 网关 + 公网分层检测）；字段名与 Tauri 版一致，两版共用 settings.json
+        public int StallMs { get; set; } = 1500;           // 入站字节停滞多久算“怀疑”
+        public int HeartbeatMs { get; set; } = 2000;       // 空闲时网关心跳间隔（有入站流量时不发）
+        public int WanIntervalSec { get; set; } = 8;       // 健康时公网探测间隔
+        public int WanTimeoutMs { get; set; } = 900;       // 单次公网探测超时
+        public int IpWaitMs { get; set; } = 8000;          // 刚连上后等 DHCP/网关的上限
+        public int UnusableBackoffSec { get; set; } = 15;  // 判死后退避基数（15→30→…→300 秒），0 = 关闭退避
+        public int DiscGraceMs { get; set; } = 1200;       // 断开后的让路窗口（信号弱时自动为 0）
         public bool Notify { get; set; } = true;           // 切换时弹出托盘通知
 
         // 频段偏好
@@ -48,10 +56,13 @@ namespace WifiPriority.Models
 
     public static class SettingsStore
     {
-        const int CurrentSchema = 3;
+        const int CurrentSchema = 4;
 
         /// <summary>启动时把旧配置里的“频段策略”从 Global 迁移成了 Same（引擎启动后写一条日志告知用户）。</summary>
         public static bool BandPolicyMigrated;
+
+        /// <summary>启动时把旧配置里的“联网检测”改成了默认开启（引擎启动后写一条日志告知用户）。</summary>
+        public static bool InternetCheckMigrated;
 
         static readonly object Lk = new object();
 
@@ -86,14 +97,35 @@ namespace WifiPriority.Models
                                 s.BandPolicy = "Same";
                                 BandPolicyMigrated = true;
                             }
+                            // v1.1.8：新的联网检测不会再把刚连上的热点误判成“无法上网”，默认开启
+                            if (s.SchemaVersion < 4 && !s.InternetCheck)
+                            {
+                                s.InternetCheck = true;
+                                InternetCheckMigrated = true;
+                            }
                             s.SchemaVersion = CurrentSchema;
                         }
+                        Sanitize(s);
                         return s;
                     }
                 }
             }
             catch { }
             return new AppSettings { SchemaVersion = CurrentSchema };
+        }
+
+        static int Clamp(int v, int lo, int hi) => v < lo ? lo : (v > hi ? hi : v);
+
+        /// <summary>把 v1.1.8 新增的各项限制在合法范围内（与 Tauri 版 Settings::sanitize 一致）。</summary>
+        static void Sanitize(AppSettings s)
+        {
+            s.StallMs = Clamp(s.StallMs, 500, 10000);
+            s.HeartbeatMs = Clamp(s.HeartbeatMs, 500, 30000);
+            s.WanIntervalSec = Clamp(s.WanIntervalSec, 2, 120);
+            s.WanTimeoutMs = Clamp(s.WanTimeoutMs, 300, 5000);
+            s.IpWaitMs = Clamp(s.IpWaitMs, 2000, 30000);
+            s.UnusableBackoffSec = Clamp(s.UnusableBackoffSec, 0, 600);
+            s.DiscGraceMs = Clamp(s.DiscGraceMs, 0, 5000);
         }
 
         public static void Save(AppSettings s)

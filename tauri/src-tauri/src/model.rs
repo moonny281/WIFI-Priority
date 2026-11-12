@@ -5,10 +5,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 
-pub const CURRENT_SCHEMA: i64 = 3;
+pub const CURRENT_SCHEMA: i64 = 4;
 
 /// 启动时从旧配置迁移过“频段策略”（Global → Same）的标记，引擎启动后写一条日志告知用户。
 pub static BAND_POLICY_MIGRATED: AtomicBool = AtomicBool::new(false);
+
+/// 启动时从旧配置迁移过“联网检测默认开启”（schema < 4）的标记，引擎启动后写一条日志告知用户。
+pub static INTERNET_CHECK_MIGRATED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "PascalCase", default)]
@@ -26,6 +29,14 @@ pub struct Settings {
     pub manual_pause_minutes: i64,
     pub takeover_unlisted: bool,
     pub internet_check: bool,
+    // v1.1.8 链路健康检测（硬件读数 + 网关 + 公网分层检测）
+    pub stall_ms: i64,             // 入站字节停滞多久算“怀疑”
+    pub heartbeat_ms: i64,         // 空闲时网关心跳间隔（有入站流量时不发）
+    pub wan_interval_sec: i64,     // 健康时公网探测间隔
+    pub wan_timeout_ms: i64,       // 单次公网探测超时
+    pub ip_wait_ms: i64,           // 刚连上后等 DHCP/网关的上限
+    pub unusable_backoff_sec: i64, // 判死后退避基数（15→30→60→…→300 秒），0 = 关闭退避
+    pub disc_grace_ms: i64,        // 断开后的让路窗口（信号弱时自动为 0）
     pub notify: bool,
 
     // 频段偏好：Off / Same / Global；5G / 2.4G
@@ -61,7 +72,14 @@ impl Default for Settings {
             cooldown_sec: 8,
             manual_pause_minutes: 10,
             takeover_unlisted: true,
-            internet_check: false,
+            internet_check: true,
+            stall_ms: 1500,
+            heartbeat_ms: 2000,
+            wan_interval_sec: 8,
+            wan_timeout_ms: 900,
+            ip_wait_ms: 8000,
+            unusable_backoff_sec: 15,
+            disc_grace_ms: 1200,
             notify: true,
             band_policy: "Same".into(),
             prefer_band: "5G".into(),
@@ -102,6 +120,13 @@ impl Settings {
                 s.band_policy = "Same".into();
                 BAND_POLICY_MIGRATED.store(true, std::sync::atomic::Ordering::SeqCst);
             }
+            // v1.1.8：新的联网检测（硬件读数 + 绑定网卡的分层探测）不会再把刚连上的热点误判成“无法上网”，默认开启。
+            if s.schema_version < 4 {
+                if !s.internet_check {
+                    s.internet_check = true;
+                    INTERNET_CHECK_MIGRATED.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
             s.schema_version = CURRENT_SCHEMA;
         }
         s.sanitize();
@@ -120,6 +145,13 @@ impl Settings {
         self.confirm_ms = self.confirm_ms.clamp(0, 10_000);
         self.cooldown_sec = self.cooldown_sec.clamp(0, 3600);
         self.manual_pause_minutes = self.manual_pause_minutes.clamp(0, 1440);
+        self.stall_ms = self.stall_ms.clamp(500, 10_000);
+        self.heartbeat_ms = self.heartbeat_ms.clamp(500, 30_000);
+        self.wan_interval_sec = self.wan_interval_sec.clamp(2, 120);
+        self.wan_timeout_ms = self.wan_timeout_ms.clamp(300, 5_000);
+        self.ip_wait_ms = self.ip_wait_ms.clamp(2_000, 30_000);
+        self.unusable_backoff_sec = self.unusable_backoff_sec.clamp(0, 600);
+        self.disc_grace_ms = self.disc_grace_ms.clamp(0, 5_000);
         self.overlay_opacity = self.overlay_opacity.clamp(0.2, 1.0);
         self.overlay_scale = self.overlay_scale.clamp(0.7, 2.0);
         if !matches!(self.band_policy.as_str(), "Off" | "Same" | "Global") {
