@@ -86,6 +86,13 @@ pub struct Decider {
     no_net: Arc<Mutex<Option<String>>>, // 当前连着、但检测不到互联网的 WiFi。离开它就清除，不留冷却
     unusable: UnusableMap, // 带退避的“暂不重试”表（链路监视线程写入）
     attempt_fail_at: i64,  // 最近一次收到驱动“连接请求失败”通知的时间（0 = 没有）
+    // v1.1.9：热点“刚出现”/“刚关掉”要立刻反应
+    vis_init: bool,                         // 是否已经有过一轮可见性记录（程序刚启动时已经在场的网络不算“刚出现”）
+    vis: std::collections::HashSet<String>, // 上一轮可见（未过期）的列表内网络
+    appeared: HashMap<String, i64>,         // 从“不可见”变为“可见”的时间：刚出现的更高优先级网络免冷却、免确认
+    hunting: bool,                          // 有更高优先级的已保存网络当前不可见（或当前不可用 / 未连接）：引擎用更短的间隔扫描，等它一出现就连
+    left_ssid: Option<String>,              // 最近一次非程序发起断开前所在的网络
+    scan_done_at: i64,                      // 最近一次扫描完成的时间
     bad: BadMap,
 }
 
@@ -200,6 +207,12 @@ impl Decider {
             no_net: Arc::new(Mutex::new(None)),
             unusable: Arc::new(Mutex::new(HashMap::new())),
             attempt_fail_at: 0,
+            vis_init: false,
+            vis: std::collections::HashSet::new(),
+            appeared: HashMap::new(),
+            hunting: false,
+            left_ssid: None,
+            scan_done_at: 0,
             bad: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -220,6 +233,27 @@ impl Decider {
     }
 
     /// 引擎收到驱动的“连接请求失败”通知（ACM 11）：不再等满 SETTLE_MS，下一轮评估就按失败处理。
+    /// 引擎收到“扫描完成”通知：断线后用它判断刚才那个网络是不是真的没了（热点被关）。
+    pub fn note_scan_done(&mut self, now: i64) {
+        self.scan_done_at = now;
+    }
+
+    /// 引擎据此决定扫描间隔：true = 用更短的间隔扫描（热点一出现就能连上）。
+    pub fn hunting(&self) -> bool {
+        self.hunting
+    }
+
+    /// 断线前所在的网络，在断线之后的扫描里没有任何接入点被更新过 = 它真的没了（热点被关），而不是用户手动换网。
+    fn left_gone(&self, st: &WifiState) -> bool {
+        match &self.left_ssid {
+            Some(l) => !st
+                .nearby
+                .iter()
+                .any(|n| &n.ssid == l && n.bss.iter().any(|b| b.changed_at < 0 || b.changed_at > self.disc_at)),
+            None => false,
+        }
+    }
+
     pub fn note_attempt_failed(&mut self, now: i64) {
         self.attempt_fail_at = now.max(1);
     }
@@ -249,6 +283,7 @@ impl Decider {
 
     pub fn decide(&mut self, st: &WifiState, s: &Settings, now: i64, paused_in: bool) -> Decision {
         let mut d = Decision::default();
+        self.hunting = !st.connected; // 先给个默认值；下面算出更精确的结果
         if st.connected {
             self.block_at.remove(&st.ssid); // 连上了，说明它在
         }
@@ -344,6 +379,7 @@ impl Decider {
             // 非程序发起的断开（热点被关、信号丢失）：缓存里它的条目还是旧的，必须等扫描证明它又出现了才重连
             if let Some(p) = self.prev.take() {
                 if self.last_plan.is_none() {
+                    self.left_ssid = Some(p.clone());
                     self.block_at.insert(p, now);
                 }
             }
@@ -362,7 +398,9 @@ impl Decider {
         // 刚断开（<1.2 秒）：可能是用户在 Windows 里手动换网（先断开再开始连接），也可能是系统自己在重连。
         // 这时抢着发起连接会把对方的连接打断，表现为“无法连接网络”。先等一下，看对方是否开始连接。
         // 信号本来就很弱（系统自己在漫游 / 网络已经快没了）时不再让路，立刻连下一个。
-        let grace = if self.prev_signal < s.down_threshold { 0 } else { s.disc_grace_ms };
+        // 断线之后的扫描已经证明刚才那个网络没了（热点被关）：这不是手动换网，立刻连下一个。
+        let ap_gone = !st.connected && self.disc_at != 0 && self.scan_done_at > self.disc_at && self.left_gone(st);
+        let grace = if self.prev_signal < s.down_threshold || ap_gone { 0 } else { s.disc_grace_ms };
         if !st.connected && now - self.disc_at < grace {
             return d;
         }
@@ -378,6 +416,19 @@ impl Decider {
         };
         let prefer24 = s.prefer_band == "2.4G";
         let mut cands = build_cands(st, &pri, policy, s.stale_filter);
+        // 记录“刚出现”的网络（从不可见变成可见）：热点一打开，它就是更高优先级的新出现网络
+        {
+            let vis_now: std::collections::HashSet<String> = cands.iter().map(|c| c.ssid.clone()).collect();
+            let first = !self.vis_init;
+            self.vis_init = true;
+            for n in &vis_now {
+                if !first && !self.vis.contains(n) {
+                    self.appeared.insert(n.clone(), now);
+                }
+            }
+            self.appeared.retain(|k, _| vis_now.contains(k));
+            self.vis = vis_now;
+        }
         let bad = self.bad.clone();
 
         let is_current = |c: &Cand| -> bool {
@@ -415,6 +466,14 @@ impl Decider {
         let cur_bad = cands.iter().filter(|c| is_current(c)).any(|c| is_bad(c));
         let cur_listed = cur.map(|c| pri.iter().any(|p| p == c)).unwrap_or(false);
         let cur_ok = cur_signal.map(|sg| !cur_bad && sg >= s.down_threshold).unwrap_or(false);
+
+        // 猎取模式：未连接 / 当前不可用，或者有更高优先级的已保存网络现在看不到（热点还没开）→ 引擎用更短间隔扫描
+        {
+            let cur_idx = cur.and_then(|c| pri.iter().position(|p| p == c)).unwrap_or(pri.len());
+            self.hunting = cur.is_none()
+                || !cur_ok
+                || pri.iter().take(cur_idx).any(|p| st.profiles.contains(p) && !self.vis.contains(p));
+        }
 
         // 未连接，或当前（列表内）网络已经不行了：只要求候选 >= 回落阈值，避免卡在烂信号上
         let relaxed = cur.is_none() || (cur_listed && !cur_ok);
@@ -507,6 +566,8 @@ impl Decider {
         }
 
         let same_ssid = cur.map(|c| best.ssid == c).unwrap_or(false);
+        // 刚出现（6 秒内才变成可见）的网络：不是信号抖动，不需要等确认时间，也不受升级冷却限制——热点一开就连
+        let appeared_recent = !same_ssid && self.appeared.get(&best.ssid).map_or(false, |t| now - *t < 6_000);
         let reason = if cur.is_none() {
             "当前未连接".to_string()
         } else if !cur_listed {
@@ -514,6 +575,8 @@ impl Decider {
         } else if cur_ok {
             if same_ssid {
                 format!("同一网络有更优频段（{}）", band_name(best.band))
+            } else if appeared_recent {
+                "更高优先级网络刚出现，立即切换".to_string()
             } else {
                 "出现更高优先级网络".to_string()
             }
@@ -535,7 +598,7 @@ impl Decider {
             self.pending_last_seen = now;
             let wait_confirm = now - self.pending_since < s.confirm_ms.max(0);
             let cooling = (cur_ok || !cur_listed) && now - self.last_switch < s.cooldown_sec.max(0) * 1000;
-            if wait_confirm || cooling {
+            if (wait_confirm || cooling) && !appeared_recent {
                 return d;
             }
         }

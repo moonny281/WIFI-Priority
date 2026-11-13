@@ -1,7 +1,10 @@
 import './styles.css';
 import logoUrl from './assets/logo.png';
 import { listen } from '@tauri-apps/api/event';
-import { api, applyTheme, barsHtml, bandName, level, type Info, type Nearby, type Settings, type Status } from './common';
+import {
+  api, applyTheme, barsHtml, bandName, escapeHtml, fmtBytes, fmtDuration, fmtRate, level,
+  type Info, type Nearby, type Settings, type Status, type Traffic,
+} from './common';
 
 // ====================== 页面骨架 ======================
 const TEMPLATE = `
@@ -12,6 +15,7 @@ const TEMPLATE = `
     <button class="nav-item active" data-page="overview">概览</button>
     <button class="nav-item" data-page="priority">优先级</button>
     <button class="nav-item" data-page="nearby">附近网络</button>
+    <button class="nav-item" data-page="traffic">流量</button>
     <button class="nav-item" data-page="overlay">桌面悬浮框</button>
     <button class="nav-item" data-page="settings">设置</button>
     <button class="nav-item" data-page="log">日志</button>
@@ -75,6 +79,7 @@ const TEMPLATE = `
       <div class="card">
         <label class="switch"><input type="checkbox" data-setting="OverlayEnabled" /><span>显示桌面悬浮框</span></label>
         <label class="switch"><input type="checkbox" data-setting="OverlayShowSignal" /><span>显示信号强度</span></label>
+        <label class="switch"><input type="checkbox" data-setting="OverlayShowTraffic" /><span>显示实时流量：↓↑ 速度，以及 本次连接 / 该网络今日 / 该网络累计 用量</span></label>
         <label class="switch"><input type="checkbox" data-setting="OverlayLocked" /><span>锁定位置并鼠标穿透（悬浮框不再响应点击，需在此处或托盘菜单解锁）</span></label>
       </div>
       <div class="card">
@@ -132,6 +137,7 @@ const TEMPLATE = `
         <h2>切换策略</h2>
         <div class="sub mt8" style="margin-bottom:10px">信号强度是 Windows 报告的百分比（约等于 2 × (dBm + 100)，60% ≈ −70 dBm，40% ≈ −80 dBm）。</div>
         <div class="setting"><span>主动扫描间隔（秒，0 = 连续扫描，最快）</span><input type="number" min="0" max="600" data-setting="ScanIntervalSec" /></div>
+        <div class="setting"><span>等待更高优先级网络（如热点）出现时的扫描间隔（毫秒，越小热点一开越快连上；0 = 不加速）</span><input type="number" min="0" max="10000" data-setting="HuntScanMs" /></div>
         <div class="setting"><span>切换到更高优先级所需的信号 ≥ (%)</span><input type="number" min="10" max="100" data-setting="UpThreshold" /></div>
         <div class="setting"><span>最低连接信号 (%)：目标网络信号达不到它就不去连（0 = 不限制）</span><input type="number" min="0" max="100" data-setting="MinConnectSignal" /></div>
         <div class="setting"><span>当前网络信号低于 (%) 视为过弱/消失，回落到次优先级</span><input type="number" min="0" max="95" data-setting="DownThreshold" /></div>
@@ -147,6 +153,15 @@ const TEMPLATE = `
         <label class="switch"><input type="checkbox" data-setting="StaleFilter" /><span>忽略已经消失的网络：Windows 会把关掉的热点在缓存里留一阵子，开启后不再去连它（推荐）</span></label>
         <label class="switch"><input type="checkbox" data-setting="Notify" /><span>切换时弹出系统通知</span></label>
       </div>
+    </section>
+
+    <!-- 流量 -->
+    <section class="page" id="page-traffic">
+      <div class="page-head"><h1>流量</h1><button id="btn-traffic-reset">清零全部统计</button></div>
+      <div class="sub" style="margin-bottom:14px">数据来自 WiFi 网卡驱动的硬件计数器，按“网络”和“连接”区分：一次连接 = 连上某个网络到断开 / 换网。</div>
+      <div class="card" id="traf-now"></div>
+      <div class="card"><h2>按网络</h2><div class="mt8" id="traf-nets"></div></div>
+      <div class="card"><h2>按连接（最近 30 次）</h2><div class="mt8" id="traf-sess"></div></div>
     </section>
 
     <!-- 日志 -->
@@ -542,6 +557,56 @@ function addLog(line: string): void {
   box.scrollTop = box.scrollHeight;
 }
 
+// ====================== 流量页 ======================
+function renderTrafficNow(t: Traffic | null): void {
+  const box = $('#traf-now');
+  if (!t || !t.connected) {
+    box.innerHTML = '<div class="sub">当前未连接 WiFi</div>';
+    return;
+  }
+  box.innerHTML =
+    `<div class="sub">当前连接</div><div class="big">${escapeHtml(t.ssid)}</div>` +
+    `<div class="sub mt8">实时 ↓ ${fmtRate(t.rxBps)}　↑ ${fmtRate(t.txBps)}</div>` +
+    `<div class="sub">本次连接 ${fmtBytes(t.sessRx + t.sessTx)}（↓ ${fmtBytes(t.sessRx)} ↑ ${fmtBytes(t.sessTx)}），已连接 ${fmtDuration(t.sessSecs)}</div>` +
+    `<div class="sub">该网络 今日 ${fmtBytes(t.todayRx + t.todayTx)} · 累计 ${fmtBytes(t.totalRx + t.totalTx)}</div>`;
+}
+
+function fmtTime(unix: number): string {
+  const d = new Date(unix * 1000);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+async function refreshTrafficPage(): Promise<void> {
+  const st = await api.getTrafficStats();
+  $('#traf-nets').innerHTML = st.nets.length
+    ? `<table class="tbl"><tr><th>网络</th><th class="num">今日</th><th class="num">累计</th><th class="num">连接次数</th><th>最近使用</th><th></th></tr>` +
+      st.nets
+        .map(
+          (n) =>
+            `<tr class="${n.current ? 'cur' : ''}"><td>${escapeHtml(n.ssid)}${n.current ? '（当前）' : ''}</td>` +
+            `<td class="num">${fmtBytes(n.todayRx + n.todayTx)}</td>` +
+            `<td class="num">${fmtBytes(n.totalRx + n.totalTx)}（↓ ${fmtBytes(n.totalRx)} ↑ ${fmtBytes(n.totalTx)}）</td>` +
+            `<td class="num">${n.sessions}</td><td>${n.lastSeen ? fmtTime(n.lastSeen) : ''}</td>` +
+            `<td><button data-reset="${escapeHtml(n.ssid)}">清零</button></td></tr>`,
+        )
+        .join('') +
+      '</table>'
+    : '<div class="sub">还没有统计数据，连上 WiFi 后开始记录。</div>';
+  $('#traf-sess').innerHTML = st.sessions.length
+    ? `<table class="tbl"><tr><th>网络</th><th>开始时间</th><th class="num">时长</th><th class="num">↓ 下行</th><th class="num">↑ 上行</th><th class="num">合计</th></tr>` +
+      st.sessions
+        .map(
+          (r) =>
+            `<tr class="${r.active ? 'cur' : ''}"><td>${escapeHtml(r.ssid)}${r.active ? '（进行中）' : ''}</td><td>${fmtTime(r.start)}</td>` +
+            `<td class="num">${fmtDuration(r.secs)}</td><td class="num">${fmtBytes(r.rx)}</td><td class="num">${fmtBytes(r.tx)}</td>` +
+            `<td class="num">${fmtBytes(r.rx + r.tx)}</td></tr>`,
+        )
+        .join('') +
+      '</table>'
+    : '<div class="sub">暂无连接记录。</div>';
+}
+
 // ====================== 启动 ======================
 async function init(): Promise<void> {
   $('#app').innerHTML = TEMPLATE;
@@ -566,6 +631,25 @@ async function init(): Promise<void> {
     scheduleRender();
   });
   await listen<string>('log', (e) => addLog(e.payload));
+  // 流量页：实时卡片靠 "traffic" 事件；两张表在页面可见时每 2 秒刷新一次（不可见就不查，省资源）
+  renderTrafficNow(await api.getTraffic());
+  await listen<Traffic>('traffic', (e) => renderTrafficNow(e.payload));
+  $('#btn-traffic-reset').addEventListener('click', async () => {
+    if (confirm('清零全部网络的流量统计？（当前连接的“本次用量”不受影响）')) {
+      await api.resetTraffic();
+      void refreshTrafficPage();
+    }
+  });
+  $('#traf-nets').addEventListener('click', async (e) => {
+    const b = (e.target as HTMLElement).closest('button[data-reset]') as HTMLElement | null;
+    if (b) {
+      await api.resetTraffic(b.dataset.reset);
+      void refreshTrafficPage();
+    }
+  });
+  setInterval(() => {
+    if ($('#page-traffic').classList.contains('active')) void refreshTrafficPage();
+  }, 2000);
   await listen<string>('switched', (e) => {
     lastSwitch = e.payload;
     scheduleRender();

@@ -21,11 +21,15 @@ pub struct Freshness {
     ts: HashMap<String, (u64, i64)>,
     /// 最近 3 次扫描完成的时间（升序）
     done: Vec<i64>,
+    /// v1.1.9：当前连着的接入点“静默”了——它的帧时间戳很久没变化，而且之后又完成过扫描。
+    /// 活着的接入点每次扫描都会回应、时间戳会刷新；静默说明它可能已经没了（热点被关但驱动还没报断开）。
+    /// 只用来让链路监视立刻去 ping 一下网关（驱动不更新当前接入点时间戳也只是多 ping 几下，不会误判下线）。
+    pub cur_silent: bool,
 }
 
 impl Freshness {
     pub fn new(now: i64) -> Freshness {
-        Freshness { start_at: now, ts: HashMap::new(), done: Vec::new() }
+        Freshness { start_at: now, ts: HashMap::new(), done: Vec::new(), cur_silent: false }
     }
 
     pub fn scan_done(&mut self, now: i64) {
@@ -37,6 +41,7 @@ impl Freshness {
 
     pub fn apply(&mut self, st: &mut WifiState, now: i64) {
         let cur = st.cur_bssid.as_ref().map(|c| c.to_ascii_lowercase());
+        self.cur_silent = false;
         let mut seen: HashSet<String> = HashSet::new();
         for n in st.nearby.iter_mut() {
             for b in n.bss.iter_mut() {
@@ -58,6 +63,11 @@ impl Freshness {
                 let changed = e.1;
                 if cur.as_deref() == Some(key.as_str()) {
                     b.changed_at = now; // 当前连着的接入点一定在
+                    if let Some(&last_done) = self.done.last() {
+                        if changed != 0 && now - changed > 2_500 && last_done > changed + 600 {
+                            self.cur_silent = true;
+                        }
+                    }
                     continue;
                 }
                 b.changed_at = changed;

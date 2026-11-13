@@ -39,8 +39,8 @@ fn log_line<H: Host>(host: &Arc<H>, sh: &Arc<Shared>, msg: &str) {
     let line = format!("{}  {}", time_stamp(), msg);
     if let Ok(mut l) = sh.logs.lock() {
         l.push(line.clone());
-        if l.len() > 500 {
-            l.remove(0);
+        if l.len() > 400 {
+            l.drain(0..100); // 一次丢一批，避免每条日志都 O(n) 搬移
         }
     }
     host.on_log(&line);
@@ -111,6 +111,7 @@ impl<H: Host> Engine<H> {
         let client = native::Client::open(tx);
         let native_ok = client.is_some();
         let (mon_tx, mon_rx) = mpsc::channel::<u32>();
+        let cur_link = sh.cur_link.clone();
         sh.native_mode.store(native_ok, std::sync::atomic::Ordering::Relaxed);
         Engine {
             host,
@@ -125,7 +126,7 @@ impl<H: Host> Engine<H> {
             last_sig: String::new(),
             last_pub_at: 0,
             cur_ssid: Arc::new(Mutex::new(None)),
-            cur_link: Arc::new(Mutex::new(None)),
+            cur_link,
             mon_tx,
             mon_rx: Some(mon_rx),
             conn_key: (String::new(), String::new()),
@@ -185,6 +186,12 @@ impl<H: Host> Engine<H> {
         }
         if code == 7 {
             self.fresh.scan_done(now_ms());
+            self.dec.note_scan_done(now_ms()); // 断线后用它判断原网络是不是真的没了（热点被关）
+        }
+        // 断线类通知（ACM disconnecting/disconnected、MSM disassociating/disconnected）：300 ms 后立刻扫描一次，
+        // 马上知道刚才的网络还在不在、下一个网络是否可用。延后 300 ms 是为了不打断用户手动换网的关联过程。
+        if code == 20 || code == 21 || code == native::MSM_DISASSOCIATING || code == native::MSM_DISCONNECTED {
+            self.sh.scan_asap.store(now_ms() + 300, std::sync::atomic::Ordering::Relaxed);
         }
         if code == native::ACM_CONNECTION_ATTEMPT_FAIL {
             // 驱动已经明确告知“连接请求失败”：不再傻等 SETTLE_MS
@@ -195,10 +202,20 @@ impl<H: Host> Engine<H> {
 
     fn start_scan_if_due(&mut self, s: &Settings) {
         let now = now_ms();
-        let gap = if s.scan_interval_sec <= 0 { 400 } else { s.scan_interval_sec * 1000 };
+        let normal_gap = if s.scan_interval_sec <= 0 { 400 } else { s.scan_interval_sec * 1000 };
+        // 猎取模式（有更高优先级的已保存网络现在看不到，或者当前不可用 / 未连接）：用更短的间隔扫描，热点一打开就能看到并连上。
+        // 正在大流量（视频通话 / 下载）时不加速，免得扫描打断它。
+        let busy = self.sh.busy_bps.load(std::sync::atomic::Ordering::Relaxed) > 1_500_000;
+        let gap = if s.hunt_scan_ms > 0 && self.dec.hunting() && !busy {
+            normal_gap.min(s.hunt_scan_ms)
+        } else {
+            normal_gap
+        };
+        let asap_at = self.sh.scan_asap.load(std::sync::atomic::Ordering::Relaxed);
+        let asap = asap_at != 0 && now >= asap_at;
         // 链路监视线程判死当前网络后置位：此时当前连接已经是死的，立刻扫描，不受扫描间隔与“正在连接”保护限制
         let urgent = self.sh.urgent_scan.swap(false, std::sync::atomic::Ordering::Relaxed);
-        if !urgent && now - self.last_scan_at < gap {
+        if !urgent && !asap && now - self.last_scan_at < gap {
             return;
         }
         // 正在连接时不扫描：用户在 Windows 里手动连、或我们自己刚发出的连接请求。
@@ -213,6 +230,9 @@ impl<H: Host> Engine<H> {
             return; // 上一次扫描还没完成
         }
         self.last_scan_at = now;
+        if asap {
+            self.sh.scan_asap.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut ok = false;
         if let Some(c) = &self.client {
             ok = c.scan();
@@ -250,6 +270,7 @@ impl<H: Host> Engine<H> {
         };
 
         self.fresh.apply(&mut st, now_ms());
+        self.sh.cur_silent.store(st.connected && self.fresh.cur_silent, std::sync::atomic::Ordering::Relaxed);
         ensure_current(&mut st);
         if st.connecting {
             self.connecting_seen_at = now_ms();
@@ -288,7 +309,17 @@ impl<H: Host> Engine<H> {
 
         self.publish(&st, switched);
         if self.native_ok {
-            250
+            // 稳定状态（连着、没在切换、没有在等更高优先级的网络出现、主窗口没开）降到 500 ms：事件（通知）依然立刻唤醒
+            let calm = st.connected
+                && !st.connecting
+                && !self.dec.hunting()
+                && self.dec.active_target().is_none()
+                && !self.sh.main_open.load(std::sync::atomic::Ordering::Relaxed);
+            if calm {
+                500
+            } else {
+                250
+            }
         } else {
             (s.scan_interval_sec.max(3) * 1000) as u64
         }

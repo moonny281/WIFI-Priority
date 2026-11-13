@@ -24,7 +24,17 @@
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <DebugType>none</DebugType>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+
+    <!-- v1.1.9 降低后台内存：关闭并发（后台）GC，省掉一套后台 GC 线程和额外堆；不用工作站以外的 GC；分层 PGO 关掉（省 JIT 内存） -->
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <ServerGarbageCollector>false</ServerGarbageCollector>
+    <TieredPGO>false</TieredPGO>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- GC 更积极地压缩堆、归还内存（0-9，越大越省内存、GC 越频繁；5 对这种空闲程序很合适） -->
+    <RuntimeHostConfigurationOption Include="System.GC.ConserveMemory" Value="5" />
+  </ItemGroup>
 
 
   <ItemGroup>

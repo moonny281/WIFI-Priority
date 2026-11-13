@@ -38,6 +38,8 @@ namespace WifiPriority.Services
 
         /// <summary>由引擎提供：当前连接（没连上 = null）。</summary>
         public Func<CurLink> GetCurrent;
+        /// <summary>引擎观察到当前接入点的帧时间戳很久没刷新（热点可能刚被关）：只用来立刻去 ping 网关，不会单独判死。</summary>
+        public Func<bool> GetSilent;
         /// <summary>判死：(ssid, 原因, 用时说明)。里面负责写 Decider 的不可用标记/退避表、置紧急扫描、唤醒引擎。</summary>
         public Action<string, string, string> ReportUnusable;
         /// <summary>从“不可用”恢复为健康。</summary>
@@ -173,10 +175,11 @@ namespace WifiPriority.Services
 
             bool suspect = _stall >= _s.StallMs;
             bool idleHb = now >= _nextHb && now - _lastRx >= _s.HeartbeatMs;   // 有入站流量就不用心跳
+            bool silentHb = (GetSilent?.Invoke() ?? false) && now >= _nextHb;  // 接入点静默：每个心跳周期去确认一次网关
             bool gwAlive = false;
 
             // —— L2-①：网关 ICMP（只在怀疑 / 空闲心跳时）——
-            if ((suspect || idleHb) && !_gwNoIcmp)
+            if ((suspect || idleHb || silentHb) && !_gwNoIcmp)
             {
                 _nextHb = now + _s.HeartbeatMs;
                 gwAlive = await PingAsync(_gw, 400) || await PingAsync(_gw, 400);

@@ -249,7 +249,8 @@ impl LinkState {
 }
 
 /// 一轮判定。纯逻辑：硬件读数与探测都经 Hw 取得，时间由调用方传入（毫秒）。
-pub fn evaluate<H: Hw>(hw: &H, st: &mut LinkState, guid: &[u8; 16], s: &Settings, now: i64) -> Verdict {
+/// silent：引擎观察到当前接入点的帧时间戳很久没刷新（热点可能刚被关）——只用来立刻去 ping 网关，不会单独判死。
+pub fn evaluate<H: Hw>(hw: &H, st: &mut LinkState, guid: &[u8; 16], s: &Settings, now: i64, silent: bool) -> Verdict {
     // —— L1：硬件说链路断了，直接判死，不发任何包 ——
     let snap = match hw.read_if(guid) {
         Some(x) => x,
@@ -294,11 +295,12 @@ pub fn evaluate<H: Hw>(hw: &H, st: &mut LinkState, guid: &[u8; 16], s: &Settings
 
     let suspect = st.stall_ms >= s.stall_ms;
     let idle_hb = now >= st.next_hb_at && now - st.last_rx_at >= s.heartbeat_ms; // 有入站流量就不用心跳
+    let silent_hb = silent && now >= st.next_hb_at; // 接入点静默：不管有没有入站流量，每个心跳周期去确认一次网关
     let wan_timeout = Duration::from_millis(s.wan_timeout_ms.max(1) as u64);
     let mut gw_alive = false;
 
     // —— L2-①：网关 ICMP（只在怀疑 / 空闲心跳时）——
-    if (suspect || idle_hb) && !st.gw_no_icmp {
+    if (suspect || idle_hb || silent_hb) && !st.gw_no_icmp {
         st.next_hb_at = now + s.heartbeat_ms;
         gw_alive = hw.ping(gw, 400) || hw.ping(gw, 400);
         if gw_alive {
@@ -385,7 +387,8 @@ pub fn spawn_monitor(
                 continue;
             }
 
-            let verdict = evaluate(&hw, &mut st, &c.guid, &s, now);
+            let silent = sh.cur_silent.load(Ordering::Relaxed);
+            let verdict = evaluate(&hw, &mut st, &c.guid, &s, now, silent);
             let dead_reason: Option<&'static str> = match verdict {
                 Verdict::LinkDead(why) => Some(why),
                 Verdict::NoInternet => Some("已连接，网关可达但公网不通"),

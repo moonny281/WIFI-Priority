@@ -2,9 +2,11 @@
 
 use crate::model::*;
 use crate::util::unix_now;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use crate::link::CurLink;
+use crate::traffic::{self, Acct, TrafficSnap};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub struct Shared {
     pub settings: Mutex<Settings>,
@@ -17,6 +19,13 @@ pub struct Shared {
     pub native_mode: AtomicBool,
     pub urgent_scan: AtomicBool, // 链路监视线程判死当前网络后置位：引擎下一轮无视扫描间隔立即扫描
     pub mica: AtomicBool,
+    pub main_open: AtomicBool,   // 主窗口当前是否存在（v1.1.9：关闭到托盘时窗口会被销毁以释放 WebView2 内存）
+    pub cur_silent: AtomicBool,  // 当前接入点的帧时间戳很久没刷新（热点可能刚被关）：链路监视立刻去 ping 网关
+    pub scan_asap: AtomicI64,    // 断线类通知到来后，“最早可以立即扫描”的时间（毫秒，0 = 无）
+    pub busy_bps: AtomicU64,     // 当前总流量（字节/秒）：大流量时不加速扫描，免得打断视频通话/下载
+    pub cur_link: Arc<Mutex<Option<CurLink>>>, // 引擎发布的“当前连接”，链路监视线程与流量采样线程读取
+    pub traffic: Mutex<TrafficSnap>,
+    pub acct: Mutex<Acct>,
     pub settings_dirty: AtomicBool, // 悬浮框被拖动等“后台改了设置”的情况，由保存线程落盘并通知前端
     pub overlay_target: Mutex<Option<(i32, i32)>>, // 程序最近一次设置的悬浮框位置（物理像素），用来区分“用户拖动”
 }
@@ -34,6 +43,13 @@ impl Shared {
             native_mode: AtomicBool::new(false),
             urgent_scan: AtomicBool::new(false),
             mica: AtomicBool::new(false),
+            main_open: AtomicBool::new(false),
+            cur_silent: AtomicBool::new(false),
+            scan_asap: AtomicI64::new(0),
+            busy_bps: AtomicU64::new(0),
+            cur_link: Arc::new(Mutex::new(None)),
+            traffic: Mutex::new(TrafficSnap::default()),
+            acct: Mutex::new(Acct::new(traffic::load_store())),
             settings_dirty: AtomicBool::new(false),
             overlay_target: Mutex::new(None),
         }

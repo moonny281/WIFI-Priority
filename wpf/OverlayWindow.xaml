@@ -39,6 +39,12 @@
                            MaxWidth="240" TextTrimming="CharacterEllipsis"/>
                 <TextBlock x:Name="SubText" Text="" FontSize="11.5" Margin="0,1,0,0"
                            Foreground="{DynamicResource TextSecondary}"/>
+                <!-- v1.1.9 实时流量：第一行实时 ↓↑ 速度；第二行 本次连接 / 该网络今日 / 累计 -->
+                <TextBlock x:Name="TrafText" Text="" FontSize="11.5" Margin="0,3,0,0" MinWidth="190"
+                           FontFamily="Consolas, Microsoft YaHei UI" Foreground="{DynamicResource TextPrimary}"
+                           Visibility="Collapsed"/>
+                <TextBlock x:Name="Traf2Text" Text="" FontSize="10.5" Margin="0,1,0,0"
+                           Foreground="{DynamicResource TextSecondary}" Visibility="Collapsed"/>
             </StackPanel>
         </StackPanel>
     </Border>

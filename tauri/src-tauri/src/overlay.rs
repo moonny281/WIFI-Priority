@@ -8,16 +8,22 @@ use tauri::{AppHandle, LogicalSize, Manager, PhysicalPosition};
 
 /// 按当前设置应用：显示/隐藏、锁定（鼠标穿透）、位置。
 pub fn apply(app: &AppHandle, sh: &Arc<Shared>) {
-    let s = sh.settings.lock().unwrap().clone();
-    if let Some(w) = app.get_webview_window("overlay") {
-        let _ = w.set_ignore_cursor_events(s.overlay_locked);
-        if s.overlay_enabled {
+    let (enabled, locked) = {
+        let s = sh.settings.lock().unwrap();
+        (s.overlay_enabled, s.overlay_locked)
+    };
+    if !enabled {
+        crate::winmgr::close_overlay(app); // 不显示时直接销毁窗口，释放 WebView2 内存
+        return;
+    }
+    match app.get_webview_window("overlay") {
+        Some(w) => {
+            let _ = w.set_ignore_cursor_events(locked);
             let _ = w.show();
             reposition(app, sh);
             apply_layer(app, sh);
-        } else {
-            let _ = w.hide();
         }
+        None => crate::winmgr::ensure_overlay(app, sh), // 创建完成后会再调用一次 apply
     }
 }
 

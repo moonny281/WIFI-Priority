@@ -33,3 +33,9 @@ body {
 .bars.lv2 i:nth-child(-n + 2) { background: var(--warn); }
 .bars.lv3 i:nth-child(-n + 3) { background: var(--good); }
 .bars.lv4 i { background: var(--good); }
+
+/* v1.1.9 实时流量：等宽数字 + 固定最小宽度，速度变化时窗口不抖 */
+.traf { display: flex; gap: 0.9em; margin-top: 3px; font-size: 0.82em; white-space: nowrap; font-variant-numeric: tabular-nums; min-width: 14em; }
+.traf .dn { color: var(--good); min-width: 6.6em; }
+.traf .up { color: var(--warn); }
+.traf2 { font-size: 0.76em; color: var(--text2); margin-top: 1px; white-space: nowrap; font-variant-numeric: tabular-nums; }

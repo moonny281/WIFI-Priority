@@ -52,6 +52,26 @@ pub fn update_settings(app: AppHandle, sh: State<'_, Arc<Shared>>, patch: serde_
     Ok(merged)
 }
 
+/// 当前连接的实时流量快照（悬浮框 / 主窗口启动时取一次，之后靠 "traffic" 事件更新）。
+#[tauri::command]
+pub fn get_traffic(sh: State<'_, Arc<Shared>>) -> crate::traffic::TrafficSnap {
+    sh.traffic.lock().unwrap().clone()
+}
+
+/// 按网络 / 按连接区分的用量统计。
+#[tauri::command]
+pub fn get_traffic_stats(sh: State<'_, Arc<Shared>>) -> crate::traffic::TrafficStats {
+    sh.acct.lock().unwrap().stats(util::now_ms())
+}
+
+/// 清零某个网络（不传 = 全部）的用量统计。
+#[tauri::command]
+pub fn reset_traffic(sh: State<'_, Arc<Shared>>, ssid: Option<String>) {
+    let mut a = sh.acct.lock().unwrap();
+    a.reset(ssid.as_deref());
+    a.save();
+}
+
 #[tauri::command]
 pub fn get_status(sh: State<'_, Arc<Shared>>) -> Option<EngineStatus> {
     sh.status.lock().unwrap().clone()

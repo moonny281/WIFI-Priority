@@ -68,6 +68,13 @@ namespace WifiPriority.Services
         long _skipUntil;
         // v1.1.8：链路监视确认“不可用”的网络 → 带指数退避的“暂不重试”（until 之前不当作切换目标，之后立即恢复，不是永久拉黑）
         readonly Dictionary<string, (long Until, int Level)> _unusable = new Dictionary<string, (long Until, int Level)>();
+        // v1.1.9：热点“刚出现”/“刚关掉”要立刻反应
+        bool _visInit;                                   // 是否已经有过一轮可见性记录（程序刚启动时已在场的网络不算“刚出现”）
+        HashSet<string> _vis = new HashSet<string>();    // 上一轮可见（未过期）的列表内网络
+        readonly Dictionary<string, long> _appeared = new Dictionary<string, long>();   // 从“不可见”变为“可见”的时间：刚出现的更高优先级网络免冷却、免确认
+        bool _hunting;                                   // 有更高优先级的已保存网络当前不可见（或当前不可用 / 未连接）：引擎用更短间隔扫描
+        string _leftSsid;                                // 最近一次非程序发起断开前所在的网络
+        long _scanDoneAt;                                // 最近一次扫描完成的时间
         long _attemptFailAt;        // 最近一次收到驱动“连接请求失败”通知的时间（0 = 没有）
 
         /// <summary>联网检测报告：当前连着的这个网络无法上网 → 本轮决策把它当作不可用，回退到下一个。</summary>
@@ -102,6 +109,19 @@ namespace WifiPriority.Services
         }
 
         /// <summary>引擎收到驱动的“连接请求失败”通知（ACM 11）：不再等满 SettleMs，下一轮评估就按失败处理。</summary>
+        /// <summary>引擎收到“扫描完成”通知：断线后用它判断原网络是不是真的没了（热点被关）。</summary>
+        public void NoteScanDone(long now) { _scanDoneAt = now; }
+
+        /// <summary>引擎据此决定扫描间隔：true = 用更短的间隔扫描（热点一出现就能连上）。</summary>
+        public bool Hunting => _hunting;
+
+        /// <summary>断线前所在的网络，在断线之后的扫描里没有任何接入点被更新过 = 它真的没了（热点被关），而不是用户手动换网。</summary>
+        bool LeftGone(WifiState st)
+        {
+            if (_leftSsid == null) return false;
+            return !st.Nearby.Any(n => n.Ssid == _leftSsid && n.Bss.Any(b => b.ChangedAt < 0 || b.ChangedAt > _discAt));
+        }
+
         public void NoteAttemptFailed(long now) { _attemptFailAt = Math.Max(now, 1); }
         public void ClearNoInternet(string ssid) { if (_noNet == ssid) _noNet = null; }
         public bool IsNoInternet(string ssid) => _noNet == ssid;
@@ -182,6 +202,7 @@ namespace WifiPriority.Services
         public Decision Decide(WifiState st, AppSettings s, long now, bool paused)
         {
             var d = new Decision();
+            _hunting = !st.Connected;   // 先给个默认值；下面算出更精确的结果
             if (st.Connected || st.Connecting) _discAt = 0;
             else if (_discAt == 0) _discAt = now;
             if (st.Connected) _blockAt.Remove(st.Ssid);   // 连上了，说明它在
@@ -258,7 +279,7 @@ namespace WifiPriority.Services
             else
             {
                 // 非程序发起的断开（热点被关、信号丢失）：缓存里它的条目还是旧的，必须等扫描证明它又出现了才重连
-                if (_prev != null && _lastPlan == null) _blockAt[_prev] = now;
+                if (_prev != null && _lastPlan == null) { _leftSsid = _prev; _blockAt[_prev] = now; }
                 _prev = null;
             }
 
@@ -270,7 +291,9 @@ namespace WifiPriority.Services
             // 刚断开（<1.2 秒）：可能是用户在 Windows 里手动换网（先断开再开始连接），也可能是系统自己在重连。
             // 这时抢着发起连接会把对方的连接打断，表现为“无法连接网络”。先等一下，看对方是否开始连接。
             // 信号本来就很弱（系统自己在漫游 / 网络已经快没了）时不再让路，立刻连下一个
-            long grace = _prevSignal < s.DownThreshold ? 0 : s.DiscGraceMs;
+            // 断线之后的扫描已经证明刚才那个网络没了（热点被关）：这不是手动换网，立刻连下一个。
+            bool apGone = !st.Connected && _discAt != 0 && _scanDoneAt > _discAt && LeftGone(st);
+            long grace = _prevSignal < s.DownThreshold || apGone ? 0 : s.DiscGraceMs;
             if (!st.Connected && now - _discAt < grace) return d;
             if (now < _notBefore) return d;
 
@@ -278,6 +301,16 @@ namespace WifiPriority.Services
             string policy = s.BandPolicy == "Off" || s.BandPolicy == "Global" ? s.BandPolicy : "Same";
             bool prefer24 = s.PreferBand == "2.4G";
             var cands = BuildCands(st, pri, policy, s.StaleFilter);
+            // 记录“刚出现”的网络（从不可见变成可见）：热点一打开，它就是更高优先级的新出现网络
+            {
+                var visNow = new HashSet<string>(cands.Select(c => c.Ssid));
+                bool visFirst = !_visInit;
+                _visInit = true;
+                foreach (var vn in visNow)
+                    if (!visFirst && !_vis.Contains(vn)) _appeared[vn] = now;
+                foreach (var vk in _appeared.Keys.Where(x => !visNow.Contains(x)).ToList()) _appeared.Remove(vk);
+                _vis = visNow;
+            }
 
             bool IsCurrent(Cand c) =>
                 cur != null && c.Ssid == cur && (policy == "Off" || st.CurBand == 0 || c.Band == st.CurBand);
@@ -301,6 +334,14 @@ namespace WifiPriority.Services
             bool curListed = cur != null && pri.Contains(cur);
             bool curBad = curCand != null && IsBad(curCand);
             bool curOk = curCand != null && !curBad && curCand.Signal >= s.DownThreshold;
+
+            // 猎取模式：未连接 / 当前不可用，或者有更高优先级的已保存网络现在看不到（热点还没开）→ 引擎用更短间隔扫描
+            {
+                int curIdx = cur != null ? pri.IndexOf(cur) : -1;
+                if (curIdx < 0) curIdx = pri.Count;
+                _hunting = cur == null || !curOk
+                    || pri.Take(curIdx).Any(pn => st.Profiles.Contains(pn) && !_vis.Contains(pn));
+            }
 
             // 未连接，或当前（列表内）网络已经不行了：只要求候选 >= 回落阈值，避免卡在烂信号上
             bool relaxed = cur == null || (curListed && !curOk);
@@ -377,9 +418,11 @@ namespace WifiPriority.Services
             if (cur != null && !curListed && !s.TakeoverUnlisted) { ResetPending(); return d; }
 
             bool sameSsid = cur != null && best.Ssid == cur;
+            // 刚出现（6 秒内才变成可见）的网络：不是信号抖动，不需要等确认时间，也不受升级冷却限制——热点一开就连
+            bool appearedRecent = !sameSsid && _appeared.TryGetValue(best.Ssid, out var appAt) && now - appAt < 6000;
             string reason = cur == null ? "当前未连接"
                 : !curListed ? "当前网络不在优先级列表中"
-                : curOk ? (sameSsid ? $"同一网络有更优频段（{Wifi.BandName(best.Band)}）" : "出现更高优先级网络")
+                : curOk ? (sameSsid ? $"同一网络有更优频段（{Wifi.BandName(best.Band)}）" : appearedRecent ? "更高优先级网络刚出现，立即切换" : "出现更高优先级网络")
                 : curBad ? "当前网络不可用（无法上网/链路无响应），回落到次优先级"
                 : (sameSsid ? "当前频段信号丢失或过弱，回落到另一频段" : "当前网络信号丢失或过弱，回落到次优先级");
 
@@ -390,7 +433,7 @@ namespace WifiPriority.Services
                 _pendingLastSeen = now;
                 bool waitConfirm = now - _pendingSince < Math.Max(0, s.ConfirmMs);
                 bool cooling = (curOk || !curListed) && now - _lastSwitch < Math.Max(0, s.CooldownSec) * 1000L;
-                if (waitConfirm || cooling) return d;
+                if ((waitConfirm || cooling) && !appearedRecent) return d;
             }
 
             string fromLabel = cur == null ? null : Label(cur, st.CurBand);

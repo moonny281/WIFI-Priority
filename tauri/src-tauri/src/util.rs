@@ -70,3 +70,18 @@ pub fn hide_window(cmd: &mut Command) -> &mut Command {
     }
     cmd
 }
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetCurrentProcess() -> isize;
+    fn K32EmptyWorkingSet(process: isize) -> i32;
+}
+
+/// 收缩本进程的工作集：把暂时用不到的页换出去，任务管理器里的“内存”会明显降下来（用到时再按需换回）。
+pub fn trim_memory() {
+    #[cfg(windows)]
+    unsafe {
+        K32EmptyWorkingSet(GetCurrentProcess());
+    }
+}

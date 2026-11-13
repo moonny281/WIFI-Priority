@@ -28,6 +28,12 @@ namespace WifiPriority.Services
         readonly Dictionary<string, Rec> _ts = new Dictionary<string, Rec>(StringComparer.OrdinalIgnoreCase);
         readonly List<long> _done = new List<long>();       // 最近 3 次扫描完成的时间（升序）
 
+        /// <summary>
+        /// v1.1.9：当前连着的接入点“静默”了——它的帧时间戳很久没变化，而且之后又完成过扫描。活着的接入点每次扫描都会回应、时间戳会刷新；
+        /// 静默说明它可能已经没了（热点被关但驱动还没报断开）。只用来让链路监视立刻去 ping 网关，不会单独判死。
+        /// </summary>
+        public bool CurSilent { get; private set; }
+
         public BssFreshness(long now) { _startAt = now; }
 
         public void ScanDone(long now)
@@ -43,6 +49,7 @@ namespace WifiPriority.Services
         {
             lock (_lock)
             {
+                CurSilent = false;
                 var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var n in st.Nearby)
                 {
@@ -62,7 +69,12 @@ namespace WifiPriority.Services
                         }
                         else if (r.Ts != b.HostTs) { r.Ts = b.HostTs; r.ChangedAt = now; }
 
-                        if (st.CurBssid != null && string.Equals(st.CurBssid, b.Bssid, StringComparison.OrdinalIgnoreCase)) { b.ChangedAt = now; continue; }   // 当前连着的接入点一定在
+                        if (st.CurBssid != null && string.Equals(st.CurBssid, b.Bssid, StringComparison.OrdinalIgnoreCase)) 
+                        {
+                            b.ChangedAt = now;   // 当前连着的接入点一定在
+                            if (_done.Count > 0 && r.ChangedAt != 0 && now - r.ChangedAt > 2500 && _done[_done.Count - 1] > r.ChangedAt + 600) CurSilent = true;
+                            continue;
+                        }
                         b.ChangedAt = r.ChangedAt;
                         b.Stale = IsStale(r.ChangedAt, now);
                     }

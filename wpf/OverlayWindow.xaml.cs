@@ -74,6 +74,7 @@ namespace WifiPriority
             ScaleT.ScaleX = sc;
             ScaleT.ScaleY = sc;
             Bars.Visibility = S.OverlayShowSignal ? Visibility.Visible : Visibility.Collapsed;
+            RefreshTraffic();
             ApplyNativeStyles();
 
             if (S.OverlayEnabled)
@@ -135,7 +136,39 @@ namespace WifiPriority
             }
         }
 
+        TrafficSnap _traf;
+        EngineStatus _st;
+
+        /// <summary>实时流量快照（来自网卡硬件计数器）。</summary>
+        public void SetTraffic(TrafficSnap t)
+        {
+            _traf = t;
+            RefreshTraffic();
+        }
+
+        /// <summary>
+        /// 第一行实时速度（↓下行 ↑上行）；第二行按“连接 / 网络”区分用量：
+        /// 本次 = 这一次连接用了多少，今日 / 累计 = 该网络（SSID）今天 / 累计用了多少。
+        /// </summary>
+        void RefreshTraffic()
+        {
+            bool on = S.OverlayShowTraffic && _st != null && _st.Connected && _traf != null && _traf.Connected && _traf.Ssid == _st.Ssid;
+            var vis = on ? Visibility.Visible : Visibility.Collapsed;
+            TrafText.Visibility = vis;
+            Traf2Text.Visibility = vis;
+            if (!on) return;
+            TrafText.Text = $"↓ {TrafficService.FmtRate(_traf.RxBps),-11} ↑ {TrafficService.FmtRate(_traf.TxBps)}";
+            Traf2Text.Text = $"本次 {TrafficService.FmtBytes(_traf.SessRx + _traf.SessTx)} · 今日 {TrafficService.FmtBytes(_traf.TodayRx + _traf.TodayTx)} · 累计 {TrafficService.FmtBytes(_traf.TotalRx + _traf.TotalTx)}";
+        }
+
         public void UpdateStatus(EngineStatus st)
+        {
+            _st = st;
+            UpdateStatusText(st);
+            RefreshTraffic();
+        }
+
+        void UpdateStatusText(EngineStatus st)
         {
             if (st.Connecting && st.Target != null)
             {

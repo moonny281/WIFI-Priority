@@ -26,7 +26,10 @@ namespace WifiPriority.Models
         public int WanTimeoutMs { get; set; } = 900;       // 单次公网探测超时
         public int IpWaitMs { get; set; } = 8000;          // 刚连上后等 DHCP/网关的上限
         public int UnusableBackoffSec { get; set; } = 15;  // 判死后退避基数（15→30→…→300 秒），0 = 关闭退避
-        public int DiscGraceMs { get; set; } = 1200;       // 断开后的让路窗口（信号弱时自动为 0）
+        public int DiscGraceMs { get; set; } = 1200;       // 断开后的让路窗口（信号弱 / 扫描证明原网络已消失时自动为 0）
+        // v1.1.9
+        public int HuntScanMs { get; set; } = 1500;        // 有更高优先级网络“还没出现”时的扫描间隔（毫秒；热点一开就能连上）；0 = 不加速，沿用 ScanIntervalSec
+        public bool OverlayShowTraffic { get; set; } = true;   // 悬浮框显示实时流量与用量
         public bool Notify { get; set; } = true;           // 切换时弹出托盘通知
 
         // 频段偏好
@@ -126,6 +129,7 @@ namespace WifiPriority.Models
             s.IpWaitMs = Clamp(s.IpWaitMs, 2000, 30000);
             s.UnusableBackoffSec = Clamp(s.UnusableBackoffSec, 0, 600);
             s.DiscGraceMs = Clamp(s.DiscGraceMs, 0, 5000);
+            if (s.HuntScanMs != 0) s.HuntScanMs = Clamp(s.HuntScanMs, 300, 10000);
         }
 
         public static void Save(AppSettings s)

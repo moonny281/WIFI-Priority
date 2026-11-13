@@ -7,11 +7,8 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, Theme};
 
 pub fn show_main(app: &AppHandle) {
-    if let Some(w) = app.get_webview_window("main") {
-        let _ = w.show();
-        let _ = w.unminimize();
-        let _ = w.set_focus();
-    }
+    let sh = app.state::<Arc<Shared>>().inner().clone();
+    crate::winmgr::open_main(app, &sh); // 主窗口只在需要时创建
 }
 
 /// 设置被修改后统一做的事：主窗口主题、悬浮框、托盘勾选、通知前端、唤醒引擎。

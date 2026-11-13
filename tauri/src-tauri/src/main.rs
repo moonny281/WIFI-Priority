@@ -14,8 +14,10 @@ mod ops;
 mod overlay;
 mod parse;
 mod state;
+mod traffic;
 mod tray;
 mod util;
+mod winmgr;
 
 #[cfg(test)]
 mod tests;
@@ -26,8 +28,7 @@ use state::Shared;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::window::{Effect, EffectsBuilder};
-use tauri::{AppHandle, Emitter, Manager, WindowEvent};
+use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
 
 /// 引擎 → 界面 / 托盘 / 系统通知。
@@ -66,8 +67,9 @@ fn main() {
     util::now_ms(); // 启动单调时钟
     let background = std::env::args().any(|a| a == "--background");
     let shared = Arc::new(Shared::new(util::load_settings()));
+    let shared_exit = shared.clone();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         // 单实例：第二次启动只是把已有窗口唤出来（必须最先注册）
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             ops::show_main(app);
@@ -79,6 +81,9 @@ fn main() {
             commands::get_settings,
             commands::update_settings,
             commands::get_status,
+            commands::get_traffic,
+            commands::get_traffic_stats,
+            commands::reset_traffic,
             commands::get_logs,
             commands::clear_logs,
             commands::scan_now,
@@ -94,32 +99,11 @@ fn main() {
             let handle = app.handle().clone();
             let sh = shared.clone();
 
-            // ---- 主窗口：云母 + 关闭按钮缩到托盘 ----
-            let main = app.get_webview_window("main").ok_or("找不到主窗口")?;
-            let mica = main.set_effects(EffectsBuilder::new().effect(Effect::Mica).build()).is_ok();
-            sh.mica.store(mica, Ordering::Relaxed);
-            let main2 = main.clone();
-            main.on_window_event(move |ev| {
-                if let WindowEvent::CloseRequested { api, .. } = ev {
-                    api.prevent_close();
-                    let _ = main2.hide();
-                }
-            });
-
-            // ---- 悬浮框：用户拖动后记住位置 ----
-            if let Some(ov) = app.get_webview_window("overlay") {
-                let (a, s) = (handle.clone(), sh.clone());
-                ov.on_window_event(move |ev| {
-                    if let WindowEvent::Moved(pos) = ev {
-                        overlay::on_moved(&a, &s, *pos);
-                    }
-                });
-            }
-
             tray::build(&handle, &sh)?;
             ops::settings_changed(&handle, &sh); // 应用主题、悬浮框、托盘勾选
 
             engine::spawn(Arc::new(TauriHost { app: handle.clone(), sh: sh.clone() }), sh.clone());
+            traffic::spawn(handle.clone(), sh.clone(), sh.cur_link.clone()); // 实时流量与用量统计
 
             // 悬浮框被拖动时只改了内存里的设置，这里 1 秒内落盘并通知前端
             {
@@ -149,12 +133,42 @@ fn main() {
                 });
             }
 
+            // 后台内存：没有窗口时每 45 秒收一次工作集；启动 6 秒后先收一次（去掉启动峰值）
+            {
+                let s = sh.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(6));
+                    util::trim_memory();
+                    loop {
+                        std::thread::sleep(Duration::from_secs(45));
+                        if !s.main_open.load(Ordering::Relaxed) {
+                            util::trim_memory();
+                        }
+                    }
+                });
+            }
+
+            // 主窗口按需创建（--background 启动时不创建，只留托盘 + 悬浮框）
             if !background {
-                let _ = main.show();
-                let _ = main.set_focus();
+                winmgr::open_main(&handle, &sh);
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("启动 WiFi 优先级 失败");
+
+    app.run(move |_handle, event| match event {
+        // 所有窗口都关了也不退出：程序常驻托盘（真正退出走托盘“退出” / app.exit(0)，此时 code 不是 None）
+        tauri::RunEvent::ExitRequested { api, code, .. } => {
+            if code.is_none() {
+                api.prevent_exit();
+            }
+        }
+        tauri::RunEvent::Exit => {
+            if let Ok(mut a) = shared_exit.acct.lock() {
+                a.save(); // 流量统计落盘
+            }
+        }
+        _ => {}
+    });
 }

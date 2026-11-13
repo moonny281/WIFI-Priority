@@ -6,6 +6,18 @@ namespace WifiPriority.Services
 {
     internal static class Native
     {
+        [DllImport("kernel32.dll")]
+        static extern IntPtr GetCurrentProcess();
+
+        [DllImport("kernel32.dll")]
+        static extern bool K32EmptyWorkingSet(IntPtr process);
+
+        /// <summary>收缩本进程的工作集：把暂时用不到的页换出去，任务管理器里的“内存”会明显降下来（用到时再按需换回）。</summary>
+        public static void TrimWorkingSet()
+        {
+            try { K32EmptyWorkingSet(GetCurrentProcess()); } catch { }
+        }
+
         // ---------- DWM（云母 / 深色标题栏） ----------
         [StructLayout(LayoutKind.Sequential)]
         struct MARGINS { public int Left, Right, Top, Bottom; }

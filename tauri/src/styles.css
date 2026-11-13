@@ -185,3 +185,11 @@ input[type='range']::-webkit-slider-thumb {
 .log div { padding: 2px 2px; white-space: pre-wrap; word-break: break-all; }
 .page-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
 .page-head h1 { margin: 0; }
+
+/* v1.1.9 流量页 */
+.tbl { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.tbl th, .tbl td { padding: 6px 8px; text-align: left; white-space: nowrap; }
+.tbl th { font-weight: 500; opacity: .65; font-size: .86em; }
+.tbl tr + tr td { border-top: 1px solid rgba(128, 128, 128, .18); }
+.tbl .num { text-align: right; }
+.tbl .cur td:first-child { font-weight: 600; }

@@ -27,6 +27,8 @@
                              Style="{StaticResource NavButton}" Checked="Nav_Checked"/>
                 <RadioButton x:Name="NavNearby" Content="附近网络" Tag="Nearby" GroupName="nav"
                              Style="{StaticResource NavButton}" Checked="Nav_Checked"/>
+                <RadioButton x:Name="NavTraffic" Content="流量" Tag="Traffic" GroupName="nav"
+                             Style="{StaticResource NavButton}" Checked="Nav_Checked"/>
                 <RadioButton x:Name="NavOverlay" Content="桌面悬浮框" Tag="Overlay" GroupName="nav"
                              Style="{StaticResource NavButton}" Checked="Nav_Checked"/>
                 <RadioButton x:Name="NavSettings" Content="设置" Tag="Settings" GroupName="nav"
@@ -199,6 +201,39 @@
             </Grid>
 
             <!-- ========== 桌面悬浮框 ========== -->
+            <ScrollViewer x:Name="PageTraffic" Visibility="Collapsed" VerticalScrollBarVisibility="Auto">
+                <StackPanel>
+                    <Grid>
+                        <TextBlock Text="流量" Style="{StaticResource H1}"/>
+                        <Button Content="清零全部统计" HorizontalAlignment="Right" VerticalAlignment="Center" Click="TrafficResetAll_Click"/>
+                    </Grid>
+                    <TextBlock Text="数据来自 WiFi 网卡驱动的硬件计数器，按“网络”和“连接”区分：一次连接 = 连上某个网络到断开 / 换网。"
+                               Style="{StaticResource Sub}" Margin="0,4,0,14" TextWrapping="Wrap"/>
+                    <Border Style="{StaticResource Card}">
+                        <TextBlock x:Name="TrafNow" TextWrapping="Wrap" Text="当前未连接 WiFi"/>
+                    </Border>
+                    <Border Style="{StaticResource Card}">
+                        <StackPanel>
+                            <TextBlock Text="按网络（今日 / 累计 / 连接次数）" FontWeight="SemiBold"/>
+                            <TextBox x:Name="TrafNets" IsReadOnly="True" BorderThickness="0" Background="Transparent" Margin="0,8,0,0"
+                                     FontFamily="Consolas, Microsoft YaHei UI" TextWrapping="NoWrap"
+                                     HorizontalScrollBarVisibility="Auto" Foreground="{DynamicResource TextPrimary}"/>
+                            <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                                <ComboBox x:Name="TrafResetPick" Width="200" Margin="0,0,8,0"/>
+                                <Button Content="清零所选网络" Click="TrafficResetOne_Click"/>
+                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+                    <Border Style="{StaticResource Card}">
+                        <StackPanel>
+                            <TextBlock Text="按连接（最近 30 次）" FontWeight="SemiBold"/>
+                            <TextBox x:Name="TrafSess" IsReadOnly="True" BorderThickness="0" Background="Transparent" Margin="0,8,0,0"
+                                     FontFamily="Consolas, Microsoft YaHei UI" TextWrapping="NoWrap"
+                                     HorizontalScrollBarVisibility="Auto" Foreground="{DynamicResource TextPrimary}"/>
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+            </ScrollViewer>
             <ScrollViewer x:Name="PageOverlay" Visibility="Collapsed" VerticalScrollBarVisibility="Auto">
                 <StackPanel>
                     <TextBlock Text="桌面悬浮框" Style="{StaticResource H1}"/>
@@ -209,6 +244,7 @@
                         <StackPanel>
                             <CheckBox x:Name="OvEnabled" Content="显示桌面悬浮框" Style="{StaticResource Switch}" Click="Overlay_Changed"/>
                             <CheckBox x:Name="OvShowSignal" Content="显示信号强度" Style="{StaticResource Switch}" Margin="0,14,0,0" Click="Overlay_Changed"/>
+                            <CheckBox x:Name="OvShowTraffic" Content="显示实时流量：↓↑ 速度，以及 本次连接 / 该网络今日 / 该网络累计 用量" Style="{StaticResource Switch}" Margin="0,14,0,0" Click="Overlay_Changed"/>
                             <CheckBox x:Name="OvLocked" Content="锁定位置并鼠标穿透（悬浮框不再响应点击，需在此处或托盘菜单解锁）"
                                       Style="{StaticResource Switch}" Margin="0,14,0,0" Click="Overlay_Changed"/>
                         </StackPanel>
@@ -347,6 +383,10 @@
                                       Style="{StaticResource Switch}" Margin="0,16,0,0" Click="Settings_Changed"/>
                             <CheckBox x:Name="SwInternet" Content="联网检测：网卡硬件链路 + 网关 + 公网分层检测，当前网络用不了时秒级回落到下一个网络"
                                       Style="{StaticResource Switch}" Margin="0,12,0,0" Click="Settings_Changed"/>
+                            <Grid Margin="0,6">
+                                <TextBlock Text="等待更高优先级网络（如热点）出现时的扫描间隔（毫秒，越小热点一开越快连上；0 = 不加速）" VerticalAlignment="Center"/>
+                                <TextBox x:Name="TbHuntScan" Width="84" HorizontalAlignment="Right" TextAlignment="Right" LostFocus="Settings_Changed"/>
+                            </Grid>
                             <Grid Margin="0,6">
                                 <TextBlock Text="联网检测：入站流量停滞多久算“怀疑”并发起网关探测（毫秒）" VerticalAlignment="Center"/>
                                 <TextBox x:Name="TbStallMs" Width="84" HorizontalAlignment="Right" TextAlignment="Right" LostFocus="Settings_Changed"/>

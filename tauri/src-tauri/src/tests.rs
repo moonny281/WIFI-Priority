@@ -672,7 +672,7 @@ fn l1_media_down_is_dead_immediately() {
     let mut sn = hw.snap.get();
     sn.media_up = false;
     hw.snap.set(sn);
-    assert!(matches!(link::evaluate(&hw, &mut st, &G, &s, 100), Verdict::LinkDead(_)));
+    assert!(matches!(link::evaluate(&hw, &mut st, &G, &s, 100, false), Verdict::LinkDead(_)));
 }
 
 #[test]
@@ -681,8 +681,8 @@ fn l2_dhcp_timeout_replaces_fixed_12s_wait() {
     hw.gw.set(None);
     let s = Settings::fresh(); // ip_wait_ms = 8000
     let mut st = LinkState::new("X", 0, 0);
-    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 1000), Verdict::Pending);
-    assert!(matches!(link::evaluate(&hw, &mut st, &G, &s, 9000), Verdict::LinkDead(_)));
+    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 1000, false), Verdict::Pending);
+    assert!(matches!(link::evaluate(&hw, &mut st, &G, &s, 9000, false), Verdict::LinkDead(_)));
 }
 
 #[test]
@@ -690,21 +690,21 @@ fn l3_rx_stall_then_gateway_dead_is_detected_in_about_1_5s() {
     let hw = fake();
     let s = Settings::fresh(); // stall_ms = 1500
     let mut st = LinkState::new("X", 0, 0);
-    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 0), Verdict::Healthy); // 网关就绪后立刻验证公网
+    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 0, false), Verdict::Healthy); // 网关就绪后立刻验证公网
     // 之后一直在发包（out 增长），却一个字节都没收到
     for t in [250, 500, 750, 1000, 1250] {
         let mut sn = hw.snap.get();
         sn.out_octets += 1000;
         hw.snap.set(sn);
         // 停滞还没到阈值：没有新结论（Pending），但绝不能判死
-        assert!(matches!(link::evaluate(&hw, &mut st, &G, &s, t), Verdict::Pending | Verdict::Healthy), "t={}", t);
+        assert!(matches!(link::evaluate(&hw, &mut st, &G, &s, t, false), Verdict::Pending | Verdict::Healthy), "t={}", t);
     }
     let mut sn = hw.snap.get();
     sn.out_octets += 1000;
     hw.snap.set(sn);
     hw.ping_ok.set(false);
     hw.wan.set(false);
-    assert!(matches!(link::evaluate(&hw, &mut st, &G, &s, 1500), Verdict::LinkDead(_)));
+    assert!(matches!(link::evaluate(&hw, &mut st, &G, &s, 1500, false), Verdict::LinkDead(_)));
 }
 
 #[test]
@@ -712,19 +712,19 @@ fn l4_gateway_ignores_icmp_but_wan_ok_is_not_dead() {
     let hw = fake();
     let s = Settings::fresh();
     let mut st = LinkState::new("X", 0, 0);
-    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 0), Verdict::Healthy);
+    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 0, false), Verdict::Healthy);
     hw.ping_ok.set(false); // 网关不回 ICMP，但公网通
     for t in [250, 500, 750, 1000, 1250] {
         let mut sn = hw.snap.get();
         sn.out_octets += 1000;
         hw.snap.set(sn);
-        assert!(matches!(link::evaluate(&hw, &mut st, &G, &s, t), Verdict::Pending | Verdict::Healthy), "t={}", t);
+        assert!(matches!(link::evaluate(&hw, &mut st, &G, &s, t, false), Verdict::Pending | Verdict::Healthy), "t={}", t);
     }
     let mut sn = hw.snap.get();
     sn.out_octets += 1000;
     hw.snap.set(sn);
     // 停滞达到阈值：网关 ICMP 不通，但公网通 → 判健康，并记住该网关不回 ICMP
-    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 1500), Verdict::Healthy);
+    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 1500, false), Verdict::Healthy);
     assert!(st.gw_no_icmp);
 }
 
@@ -734,10 +734,10 @@ fn l5_wan_down_needs_two_consecutive_failures() {
     hw.wan.set(false);
     let s = Settings::fresh();
     let mut st = LinkState::new("X", 0, 0);
-    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 0), Verdict::Pending); // 第 1 次失败：还不下结论
-    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 500), Verdict::NoInternet); // 0.5 秒后复测，第 2 次失败
+    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 0, false), Verdict::Pending); // 第 1 次失败：还不下结论
+    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 500, false), Verdict::NoInternet); // 0.5 秒后复测，第 2 次失败
     hw.wan.set(true); // 恢复
-    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 1000), Verdict::Healthy);
+    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 1000, false), Verdict::Healthy);
 }
 
 #[test]
@@ -795,4 +795,123 @@ fn s7_internet_check_default_on_migration() {
     let s = Settings::from_json(r#"{"SchemaVersion":4,"InternetCheck":false}"#).unwrap();
     assert!(!s.internet_check);
     assert_eq!(s.disc_grace_ms, 1200);
+}
+
+// ---------------- v1.1.9：热点开/关要立刻反应、流量计费 ----------------
+use crate::link::CurLink;
+use crate::traffic::{Acct, Store};
+
+#[test]
+fn t26_hotspot_turned_on_connects_immediately_without_confirm_or_cooldown() {
+    let mut d = Decider::new();
+    let s = cfg("Same", "5G", 5000, &["Hotspot", "Home"]); // 确认时间故意设得很长
+    let mut w0 = st(Some(("Home", 2, 70)), &[("Home", 2, 70)]);
+    w0.profiles.insert("Hotspot".to_string()); // 热点配置已保存，但现在看不到
+    assert!(d.decide(&w0, &s, 1000, false).connect.is_none());
+    assert!(d.hunting(), "有更高优先级的已保存网络没出现：进入猎取模式，引擎会用更短间隔扫描");
+    // 热点打开，下一次扫描看到它：不等确认时间，立即切换
+    let w1 = st(Some(("Home", 2, 70)), &[("Hotspot", 2, 80), ("Home", 2, 70)]);
+    let p = d.decide(&w1, &s, 3000, false).connect.expect("刚出现的更高优先级网络应立即连接");
+    assert_eq!(p.ssid, "Hotspot");
+}
+
+#[test]
+fn t27_already_visible_higher_priority_still_waits_for_confirm() {
+    // 程序启动时就在场的网络、或者信号在阈值线上抖动的网络，不算“刚出现”：仍按确认时间防抖
+    let mut d = Decider::new();
+    let s = cfg("Same", "5G", 5000, &["Hotspot", "Home"]);
+    let w = st(Some(("Home", 2, 70)), &[("Hotspot", 2, 80), ("Home", 2, 70)]);
+    assert!(d.decide(&w, &s, 1000, false).connect.is_none());
+    assert!(d.decide(&w, &s, 3000, false).connect.is_none());
+    assert!(d.decide(&w, &s, 6500, false).connect.is_some());
+}
+
+#[test]
+fn t28_hotspot_turned_off_scan_proves_it_is_gone_no_grace() {
+    let s = cfg("Global", "5G", 0, &["A", "B"]);
+    let mut d = Decider::new();
+    assert!(d.decide(&st(Some(("A", 2, 80)), &[("A", 2, 80), ("B", 2, 70)]), &s, 500, false).connect.is_none());
+    // A（热点）被关：断开，附近网络里已经没有 A
+    let off = st(None, &[("B", 2, 70)]);
+    assert!(d.decide(&off, &s, 1000, false).connect.is_none()); // 刚断开、还没有扫描证据：先让路（可能是手动换网）
+    d.note_scan_done(1300); // 断线后完成了一次扫描，A 没有回应
+    assert_eq!(d.decide(&off, &s, 1400, false).connect.map(|p| p.ssid), Some("B".to_string()));
+}
+
+#[test]
+fn t29_scan_shows_old_network_still_there_keeps_grace() {
+    // 用户在 Windows 里手动换网：断开后原网络仍然在扫描结果里（时间戳还在更新）→ 继续让路，不抢着连
+    let s = cfg("Global", "5G", 0, &["A", "B"]);
+    let mut d = Decider::new();
+    assert!(d.decide(&st(Some(("A", 2, 80)), &[("A", 2, 80), ("B", 2, 70)]), &s, 500, false).connect.is_none());
+    let off = st(None, &[("A", 2, 80), ("B", 2, 70)]);
+    assert!(d.decide(&off, &s, 1000, false).connect.is_none());
+    d.note_scan_done(1300);
+    assert!(d.decide(&off, &s, 1400, false).connect.is_none());
+}
+
+#[test]
+fn f1_current_ap_silent_after_scan_is_flagged() {
+    let mut f = Freshness::new(0);
+    let mk = |ts: u64| {
+        let mut w = st(Some(("Hotspot", 2, 80)), &[("Hotspot", 2, 80)]);
+        for n in w.nearby.iter_mut() {
+            for b in n.bss.iter_mut() {
+                b.host_ts = ts;
+            }
+        }
+        w
+    };
+    f.scan_done(1000);
+    let mut w = mk(7);
+    f.apply(&mut w, 1000);
+    assert!(!f.cur_silent);
+    f.scan_done(3500);
+    let mut w = mk(7); // 时间戳一直没变，而且之后又扫描过
+    f.apply(&mut w, 4000);
+    assert!(f.cur_silent, "当前接入点静默：可能是热点刚被关，链路监视应立刻去 ping 网关");
+    let mut w = mk(8); // 时间戳又更新了
+    f.apply(&mut w, 4200);
+    assert!(!f.cur_silent);
+}
+
+#[test]
+fn tr1_traffic_split_by_connection_and_network() {
+    use std::cell::Cell;
+    let counters = Cell::new((1000u64, 500u64));
+    let read = |_: &[u8; 16]| {
+        let (i, o) = counters.get();
+        Some(link::IfSnapshot { if_index: 1, oper_up: true, media_up: true, in_octets: i, out_octets: o })
+    };
+    let cl = |ssid: &str, at: i64| CurLink { ssid: ssid.to_string(), guid: [0; 16], connected_at: at };
+    let mut a = Acct::new(Store::default());
+    let home = cl("Home", 0);
+    a.feed(Some(&home), &read, 0, "2026-11-13", 100); // 建立基线
+    counters.set((3000, 900));
+    let s = a.feed(Some(&home), &read, 1000, "2026-11-13", 101);
+    assert_eq!((s.sess_rx, s.sess_tx), (2000, 400));
+    assert_eq!(s.rx_bps, 1200); // 0.6 × 2000 B/s（轻度平滑）
+    // 换到热点：断开前的最后增量记在 Home 头上，热点从 0 开始
+    counters.set((5000, 1000));
+    let hot = cl("Hotspot", 5000);
+    let s2 = a.feed(Some(&hot), &read, 2000, "2026-11-13", 102);
+    assert_eq!(a.store.nets["Home"].total_rx, 4000);
+    assert_eq!(a.store.nets["Home"].total_tx, 500);
+    assert_eq!((s2.sess_rx, s2.sess_tx, s2.ssid.as_str()), (0, 0, "Hotspot"));
+    assert_eq!(a.store.recent.len(), 1);
+    counters.set((5600, 1100));
+    let s3 = a.feed(Some(&hot), &read, 3000, "2026-11-13", 103);
+    assert_eq!((s3.sess_rx, s3.total_rx), (600, 600));
+    // 跨天：今日清零，累计保留
+    counters.set((5700, 1100));
+    let s4 = a.feed(Some(&hot), &read, 4000, "2026-11-14", 104);
+    assert_eq!((s4.today_rx, s4.total_rx), (100, 700));
+    // 网卡计数器被重置（禁用再启用）：从 0 重新计，不会出现巨大的负数 / 溢出
+    counters.set((10, 5));
+    let s5 = a.feed(Some(&hot), &read, 5000, "2026-11-14", 105);
+    assert_eq!(s5.sess_rx, 700 + 10);
+    // 断开：快照清空，本次连接进入“最近连接”
+    let s6 = a.feed(None, &read, 6000, "2026-11-14", 106);
+    assert!(!s6.connected);
+    assert_eq!(a.store.recent.len(), 2);
 }

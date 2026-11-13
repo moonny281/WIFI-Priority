@@ -36,7 +36,10 @@ pub struct Settings {
     pub wan_timeout_ms: i64,       // 单次公网探测超时
     pub ip_wait_ms: i64,           // 刚连上后等 DHCP/网关的上限
     pub unusable_backoff_sec: i64, // 判死后退避基数（15→30→60→…→300 秒），0 = 关闭退避
-    pub disc_grace_ms: i64,        // 断开后的让路窗口（信号弱时自动为 0）
+    pub disc_grace_ms: i64,        // 断开后的让路窗口（信号弱 / 扫描证明原网络已消失时自动为 0）
+    // v1.1.9
+    pub hunt_scan_ms: i64,         // 有更高优先级网络“还没出现”时的扫描间隔（毫秒；热点一开就能连上）；0 = 不加速，沿用 ScanIntervalSec
+    pub overlay_show_traffic: bool, // 悬浮框显示实时流量与用量
     pub notify: bool,
 
     // 频段偏好：Off / Same / Global；5G / 2.4G
@@ -80,6 +83,8 @@ impl Default for Settings {
             ip_wait_ms: 8000,
             unusable_backoff_sec: 15,
             disc_grace_ms: 1200,
+            hunt_scan_ms: 1500,
+            overlay_show_traffic: true,
             notify: true,
             band_policy: "Same".into(),
             prefer_band: "5G".into(),
@@ -152,6 +157,9 @@ impl Settings {
         self.ip_wait_ms = self.ip_wait_ms.clamp(2_000, 30_000);
         self.unusable_backoff_sec = self.unusable_backoff_sec.clamp(0, 600);
         self.disc_grace_ms = self.disc_grace_ms.clamp(0, 5_000);
+        if self.hunt_scan_ms != 0 {
+            self.hunt_scan_ms = self.hunt_scan_ms.clamp(300, 10_000);
+        }
         self.overlay_opacity = self.overlay_opacity.clamp(0.2, 1.0);
         self.overlay_scale = self.overlay_scale.clamp(0.7, 2.0);
         if !matches!(self.band_policy.as_str(), "Off" | "Same" | "Global") {

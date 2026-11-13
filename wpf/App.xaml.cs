@@ -14,6 +14,8 @@ namespace WifiPriority
     {
         public static AppSettings Settings;
         public static SwitchEngine Engine;
+        /// <summary>主窗口是否可见（引擎线程不能直接读 WPF 控件的 IsVisible，由主窗口的 IsVisibleChanged 维护）。</summary>
+        public static volatile bool MainVisible;
         public static MainWindow MainWin;
         public static OverlayWindow Overlay;
         public static TrayService Tray;
@@ -81,6 +83,13 @@ namespace WifiPriority
 
             Engine = new SwitchEngine(Settings);
             Engine.Log += m => Log(m);
+            // 有人在看流量（悬浮框显示流量 / 主窗口可见）才 1 秒采样并推送；否则 3 秒采一次，只为把用量记对
+            Engine.IsWatching = () => (Settings.OverlayEnabled && Settings.OverlayShowTraffic) || MainVisible;
+            Engine.Traffic.Updated += snap => Dispatcher.BeginInvoke(new Action(() =>
+            {
+                Overlay?.SetTraffic(snap);
+                MainWin?.OnTraffic(snap);
+            }));
             if (SettingsStore.InternetCheckMigrated) SettingsStore.Save(Settings);   // v1.1.8：联网检测默认开启，把迁移结果落盘
             if (SettingsStore.BandPolicyMigrated)
             {
@@ -102,6 +111,22 @@ namespace WifiPriority
 
             MainWin = new MainWindow();
             Overlay = new OverlayWindow(Settings);
+
+            // 后台内存：主窗口不可见时每 60 秒做一次压缩式 GC 并收缩工作集；启动 6 秒后先收一次（去掉启动峰值）
+            {
+                Action trim = () =>
+                {
+                    if (MainVisible) return;
+                    GC.Collect(2, GCCollectionMode.Forced, true, true);
+                    Services.Native.TrimWorkingSet();
+                };
+                var first = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromSeconds(6) };
+                first.Tick += (s2, a2) => { first.Stop(); trim(); };
+                first.Start();
+                var every = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromSeconds(60) };
+                every.Tick += (s2, a2) => trim();
+                every.Start();
+            }
 
             Tray = new TrayService();
             Tray.OpenRequested = ShowMain;

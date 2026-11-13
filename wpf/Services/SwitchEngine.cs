@@ -38,6 +38,11 @@ namespace WifiPriority.Services
         volatile CurLink _curLink;
         string _connKey = "";     // ssid|bssid：变了就算“新的一次连接”
         long _connAt;
+        long _scanAsapAt;            // 断线类通知到来后，“最早可以立即扫描”的时间（0 = 无）
+        /// <summary>实时流量与用量统计（硬件计数器）。</summary>
+        public TrafficService Traffic { get; } = new TrafficService();
+        /// <summary>界面是否有人在看流量（悬浮框显示流量 / 主窗口可见）：有人看才 1 秒采样并推送。</summary>
+        public Func<bool> IsWatching;
         volatile bool _urgentScan;   // 链路监视判死当前网络后置位：下一轮无视扫描间隔立即扫描
 
         public volatile bool ManualPause;
@@ -71,6 +76,7 @@ namespace WifiPriority.Services
             _link = new LinkMonitor(_s)
             {
                 GetCurrent = () => _curLink,
+                GetSilent = () => _fresh.CurSilent,
                 ReportUnusable = (ssid, why, took) =>
                 {
                     long wait = _dec.ReportUnusable(ssid, Now, _s.UnusableBackoffSec);
@@ -84,8 +90,12 @@ namespace WifiPriority.Services
                 ClearBackoff = ssid => _dec.ClearUnusable(ssid),
             };
 
+            Traffic.GetCurrent = () => _curLink;
+            Traffic.IsWatching = () => IsWatching?.Invoke() ?? false;
+
             _cts = new CancellationTokenSource();
             var token = _cts.Token;
+            Task.Run(() => Traffic.RunAsync(token));
             Task.Run(() => LoopAsync(token));
             Task.Run(() => _link.RunAsync(token));
             Task.Run(() => InternetLoopAsync(token));   // 旧的联网检测只在 netsh 兼容模式（拿不到网卡 GUID）下工作
@@ -94,13 +104,17 @@ namespace WifiPriority.Services
         public void Stop()
         {
             try { _cts?.Cancel(); } catch { }
+            try { Traffic.Save(); } catch { }
             try { _wlan.Dispose(); } catch { }
         }
 
         void OnWlanEvent(uint code)
         {
             if (code == 7 || code == 8) _scanBusy = false;   // 扫描完成 / 失败
-            if (code == 7) _fresh.ScanDone(Now);
+            if (code == 7) { _fresh.ScanDone(Now); _dec.NoteScanDone(Now); }   // 断线后用它判断原网络是不是真的没了（热点被关）
+            // 断线类通知（ACM disconnecting/disconnected、MSM disassociating/disconnected）：300 ms 后立刻扫描一次，
+            // 马上知道刚才的网络还在不在、下一个网络是否可用。延后 300 ms 是为了不打断用户手动换网的关联过程。
+            if (code == 20 || code == 21 || code == (WlanClient.MsmFlag | 9) || code == (WlanClient.MsmFlag | 10)) _scanAsapAt = Now + 300;
             if (code == WlanClient.AcmConnectionAttemptFail) _dec.NoteAttemptFailed(Now);   // 驱动已经明确告知“连接请求失败”：不再傻等 SettleMs
             _link?.Wake();                                                                    // ACM / MSM 事件都叫醒链路监视
             TriggerNow();
@@ -134,17 +148,23 @@ namespace WifiPriority.Services
 
         void StartScanIfDue(long now)
         {
-            long gap = _s.ScanIntervalSec <= 0 ? 400 : _s.ScanIntervalSec * 1000L;
+            long normalGap = _s.ScanIntervalSec <= 0 ? 400 : _s.ScanIntervalSec * 1000L;
+            // 猎取模式（有更高优先级的已保存网络现在看不到，或者当前不可用 / 未连接）：用更短的间隔扫描，热点一打开就能看到并连上。
+            // 正在大流量（视频通话 / 下载）时不加速，免得扫描打断它。
+            bool busy = Traffic.BusyBps > 1500000;
+            long gap = _s.HuntScanMs > 0 && _dec.Hunting && !busy ? Math.Min(normalGap, _s.HuntScanMs) : normalGap;
+            bool asap = _scanAsapAt != 0 && now >= _scanAsapAt;
             // 链路监视判死当前网络后置位：此时当前连接已经是死的，立刻扫描，不受扫描间隔与“正在连接”保护限制
             bool urgent = _urgentScan;
             _urgentScan = false;
-            if (!urgent && now - _lastScanAt < gap) return;
+            if (!urgent && !asap && now - _lastScanAt < gap) return;
             // 正在连接时不扫描：用户在 Windows 里手动连、或我们自己刚发出的连接请求。
             // 有些网卡驱动在关联过程中被扫描打断会直接报“无法连接网络”（手机热点响应慢，更容易中招）。
             if (!urgent && _connectingSeenAt != 0 && now - _connectingSeenAt < 2000) return;
             if (_dec.ActiveTarget != null) return;
             if (_scanBusy && now - _lastScanAt < 6000) return;      // 上一次扫描还没完成
             _lastScanAt = now;
+            if (asap) _scanAsapAt = 0;
             bool ok = _wlan.Scan();
             _scanBusy = ok;   // 请求没被接受就不会有“扫描完成”通知，别挂着空等
         }
@@ -210,7 +230,9 @@ namespace WifiPriority.Services
             if (dec.Connect != null) await ExecuteAsync(dec.Connect, t0);
 
             Publish(st, dec.Connect != null);
-            return _native ? 250 : Math.Max(3000, _s.ScanIntervalSec * 1000);
+            // 稳定状态（连着、没在切换、没有在等更高优先级的网络出现）降到 500 ms：事件（通知）依然立刻唤醒
+            bool calm = st.Connected && !st.Connecting && !_dec.Hunting && _dec.ActiveTarget == null;
+            return _native ? (calm ? 500 : 250) : Math.Max(3000, _s.ScanIntervalSec * 1000);
         }
 
         async Task ExecuteAsync(Plan plan, Stopwatch t0)

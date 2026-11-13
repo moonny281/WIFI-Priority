@@ -37,6 +37,9 @@ namespace WifiPriority
             if (plus > 0) ver = ver.Substring(0, plus);
             VersionText.Text = ver.Length > 0 ? "v" + ver : "";
 
+            _trafTimer.Tick += (a, b) => { if (PageTraffic.Visibility == Visibility.Visible) RefreshTrafficPage(); };
+            _trafTimer.Start();
+            IsVisibleChanged += (a, b) => App.MainVisible = IsVisible;   // 引擎线程不能直接读 IsVisible，用静态标志
             PriorityList.ItemsSource = _pri;
             NearbyList.ItemsSource = _near;
             LogList.ItemsSource = _logs;
@@ -89,6 +92,69 @@ namespace WifiPriority
             PageOverlay.Visibility = tag == "Overlay" ? Visibility.Visible : Visibility.Collapsed;
             PageSettings.Visibility = tag == "Settings" ? Visibility.Visible : Visibility.Collapsed;
             PageLog.Visibility = tag == "Log" ? Visibility.Visible : Visibility.Collapsed;
+            PageTraffic.Visibility = tag == "Traffic" ? Visibility.Visible : Visibility.Collapsed;
+            if (tag == "Traffic") RefreshTrafficPage();
+        }
+
+        // ================= 流量页 =================
+        // 实时卡片靠引擎的流量事件刷新；两张表在页面可见时每 2 秒刷新一次（不可见就不查，省资源）。
+        readonly System.Windows.Threading.DispatcherTimer _trafTimer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
+
+        public void OnTraffic(TrafficSnap t)
+        {
+            if (!t.Connected) { TrafNow.Text = "当前未连接 WiFi"; return; }
+            TrafNow.Text =
+                $"当前连接：{t.Ssid}\n" +
+                $"实时  ↓ {TrafficService.FmtRate(t.RxBps)}    ↑ {TrafficService.FmtRate(t.TxBps)}\n" +
+                $"本次连接  {TrafficService.FmtBytes(t.SessRx + t.SessTx)}（↓ {TrafficService.FmtBytes(t.SessRx)}  ↑ {TrafficService.FmtBytes(t.SessTx)}），已连接 {TrafficService.FmtDuration(t.SessSecs)}\n" +
+                $"该网络  今日 {TrafficService.FmtBytes(t.TodayRx + t.TodayTx)} · 累计 {TrafficService.FmtBytes(t.TotalRx + t.TotalTx)}";
+        }
+
+        static string FmtTime(long unix) => DateTimeOffset.FromUnixTimeSeconds(unix).ToLocalTime().ToString("MM-dd HH:mm");
+
+        void RefreshTrafficPage()
+        {
+            if (App.Engine == null) return;
+            var (nets, sess, cur) = App.Engine.Traffic.Stats(App.Engine.Traffic.NowMs);
+            OnTraffic(App.Engine.Traffic.Snap);
+
+            var sb = new System.Text.StringBuilder();
+            foreach (var kv in nets)
+            {
+                var n = kv.Value;
+                sb.AppendLine($"{kv.Key}{(kv.Key == cur ? "（当前）" : "")}   今日 {TrafficService.FmtBytes(n.TodayRx + n.TodayTx)}   累计 {TrafficService.FmtBytes(n.TotalRx + n.TotalTx)}（↓ {TrafficService.FmtBytes(n.TotalRx)} ↑ {TrafficService.FmtBytes(n.TotalTx)}）   连接 {n.Sessions} 次   最近 {(n.LastSeen > 0 ? FmtTime(n.LastSeen) : "")}");
+            }
+            TrafNets.Text = nets.Count > 0 ? sb.ToString().TrimEnd() : "还没有统计数据，连上 WiFi 后开始记录。";
+
+            var sb2 = new System.Text.StringBuilder();
+            foreach (var r in sess)
+                sb2.AppendLine($"{r.Ssid}{(r.Active ? "（进行中）" : "")}   {FmtTime(r.Start)}   时长 {TrafficService.FmtDuration(r.Secs)}   ↓ {TrafficService.FmtBytes(r.Rx)}  ↑ {TrafficService.FmtBytes(r.Tx)}  合计 {TrafficService.FmtBytes(r.Rx + r.Tx)}");
+            TrafSess.Text = sess.Count > 0 ? sb2.ToString().TrimEnd() : "暂无连接记录。";
+
+            string pick = TrafResetPick.SelectedItem as string;
+            var names = nets.Select(k => k.Key).ToList();
+            if (!TrafResetPick.Items.Cast<string>().SequenceEqual(names))
+            {
+                TrafResetPick.Items.Clear();
+                foreach (var nm in names) TrafResetPick.Items.Add(nm);
+                if (pick != null && names.Contains(pick)) TrafResetPick.SelectedItem = pick;
+            }
+        }
+
+        void TrafficResetAll_Click(object sender, RoutedEventArgs e)
+        {
+            if (MessageBox.Show("清零全部网络的流量统计？（当前连接的“本次用量”不受影响）", "流量", MessageBoxButton.YesNo) != MessageBoxResult.Yes) return;
+            App.Engine.Traffic.Reset(null);
+            RefreshTrafficPage();
+        }
+
+        void TrafficResetOne_Click(object sender, RoutedEventArgs e)
+        {
+            if (TrafResetPick.SelectedItem is string ssid)
+            {
+                App.Engine.Traffic.Reset(ssid);
+                RefreshTrafficPage();
+            }
         }
 
         void ExitApp_Click(object sender, RoutedEventArgs e) => App.ExitApp();
@@ -330,6 +396,7 @@ namespace WifiPriority
             if (!_ready || _loading) return;
             S.OverlayEnabled = OvEnabled.IsChecked == true;
             S.OverlayShowSignal = OvShowSignal.IsChecked == true;
+            S.OverlayShowTraffic = OvShowTraffic.IsChecked == true;
             S.OverlayLocked = OvLocked.IsChecked == true;
             App.SaveSettings();
             App.Overlay.ApplySettings();
@@ -380,6 +447,7 @@ namespace WifiPriority
 
             OvEnabled.IsChecked = S.OverlayEnabled;
             OvShowSignal.IsChecked = S.OverlayShowSignal;
+            OvShowTraffic.IsChecked = S.OverlayShowTraffic;
             OvLocked.IsChecked = S.OverlayLocked;
             OvLayerTop.IsChecked = S.OverlayLayer != "Desktop";
             OvLayerDesktop.IsChecked = S.OverlayLayer == "Desktop";
@@ -397,6 +465,7 @@ namespace WifiPriority
             TbManualPause.Text = S.ManualPauseMinutes.ToString();
             SwTakeover.IsChecked = S.TakeoverUnlisted;
             SwInternet.IsChecked = S.InternetCheck;
+            TbHuntScan.Text = S.HuntScanMs.ToString();
             TbStallMs.Text = S.StallMs.ToString();
             TbWanInterval.Text = S.WanIntervalSec.ToString();
             TbBackoff.Text = S.UnusableBackoffSec.ToString();
@@ -439,6 +508,8 @@ namespace WifiPriority
             S.ManualPauseMinutes = ParseInt(TbManualPause, S.ManualPauseMinutes, 0, 1440);
             S.TakeoverUnlisted = SwTakeover.IsChecked == true;
             S.InternetCheck = SwInternet.IsChecked == true;
+            S.HuntScanMs = ParseInt(TbHuntScan, S.HuntScanMs, 0, 10000);
+            if (S.HuntScanMs != 0 && S.HuntScanMs < 300) S.HuntScanMs = 300;
             S.StallMs = ParseInt(TbStallMs, S.StallMs, 500, 10000);
             S.WanIntervalSec = ParseInt(TbWanInterval, S.WanIntervalSec, 2, 120);
             S.UnusableBackoffSec = ParseInt(TbBackoff, S.UnusableBackoffSec, 0, 600);
