@@ -20,13 +20,13 @@ namespace WifiPriority.Models
         public bool TakeoverUnlisted { get; set; } = true; // 当前连接的网络不在列表中时，是否也切到列表中的网络
         public bool InternetCheck { get; set; } = true;    // 联网检测：链路/网关/公网不可用时视为不可用（v1.1.8 起默认开启）
         // v1.1.8 链路健康检测（硬件读数 + 网关 + 公网分层检测）；字段名与 Tauri 版一致，两版共用 settings.json
-        public int StallMs { get; set; } = 1500;           // 入站字节停滞多久算“怀疑”
-        public int HeartbeatMs { get; set; } = 2000;       // 空闲时网关心跳间隔（有入站流量时不发）
+        public int StallMs { get; set; } = 1000;           // 距最后一次收到数据多久算“怀疑”（墙钟）
+        public int HeartbeatMs { get; set; } = 1500;       // 完全空闲时，多久没收到任何数据就去 ping 一次网关
         public int WanIntervalSec { get; set; } = 8;       // 健康时公网探测间隔
         public int WanTimeoutMs { get; set; } = 900;       // 单次公网探测超时
         public int IpWaitMs { get; set; } = 8000;          // 刚连上后等 DHCP/网关的上限
         public int UnusableBackoffSec { get; set; } = 15;  // 判死后退避基数（15→30→…→300 秒），0 = 关闭退避
-        public int DiscGraceMs { get; set; } = 1200;       // 断开后的让路窗口（信号弱 / 扫描证明原网络已消失时自动为 0）
+        public int DiscGraceMs { get; set; } = 400;        // 断开后的让路窗口（信号弱 / 扫描证明原网络已消失时自动为 0）
         // v1.1.9
         public int HuntScanMs { get; set; } = 1500;        // 有更高优先级网络“还没出现”时的扫描间隔（毫秒；热点一开就能连上）；0 = 不加速，沿用 ScanIntervalSec
         public bool OverlayShowTraffic { get; set; } = true;   // 悬浮框显示实时流量与用量
@@ -59,7 +59,7 @@ namespace WifiPriority.Models
 
     public static class SettingsStore
     {
-        const int CurrentSchema = 4;
+        const int CurrentSchema = 5;
 
         /// <summary>启动时把旧配置里的“频段策略”从 Global 迁移成了 Same（引擎启动后写一条日志告知用户）。</summary>
         public static bool BandPolicyMigrated;
@@ -105,6 +105,13 @@ namespace WifiPriority.Models
                             {
                                 s.InternetCheck = true;
                                 InternetCheckMigrated = true;
+                            }
+                            // v1.2.0：回落更快。只迁移还停留在旧默认值上的设置，用户自己改过的不动
+                            if (s.SchemaVersion < 5)
+                            {
+                                if (s.StallMs == 1500) s.StallMs = 1000;
+                                if (s.HeartbeatMs == 2000) s.HeartbeatMs = 1500;
+                                if (s.DiscGraceMs == 1200) s.DiscGraceMs = 400;
                             }
                             s.SchemaVersion = CurrentSchema;
                         }

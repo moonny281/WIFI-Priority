@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 
-pub const CURRENT_SCHEMA: i64 = 4;
+pub const CURRENT_SCHEMA: i64 = 5;
 
 /// 启动时从旧配置迁移过“频段策略”（Global → Same）的标记，引擎启动后写一条日志告知用户。
 pub static BAND_POLICY_MIGRATED: AtomicBool = AtomicBool::new(false);
@@ -40,6 +40,7 @@ pub struct Settings {
     // v1.1.9
     pub hunt_scan_ms: i64,         // 有更高优先级网络“还没出现”时的扫描间隔（毫秒；热点一开就能连上）；0 = 不加速，沿用 ScanIntervalSec
     pub overlay_show_traffic: bool, // 悬浮框显示实时流量与用量
+    pub overlay_native: bool,       // v1.2.0：悬浮框用原生窗口（GDI）绘制，不创建 WebView2——后台内存占用低一个数量级；关掉则用网页版悬浮框
     pub notify: bool,
 
     // 频段偏好：Off / Same / Global；5G / 2.4G
@@ -76,15 +77,16 @@ impl Default for Settings {
             manual_pause_minutes: 10,
             takeover_unlisted: true,
             internet_check: true,
-            stall_ms: 1500,
-            heartbeat_ms: 2000,
+            stall_ms: 1000,
+            heartbeat_ms: 1500,
             wan_interval_sec: 8,
             wan_timeout_ms: 900,
             ip_wait_ms: 8000,
             unusable_backoff_sec: 15,
-            disc_grace_ms: 1200,
+            disc_grace_ms: 400,
             hunt_scan_ms: 1500,
             overlay_show_traffic: true,
+            overlay_native: true,
             notify: true,
             band_policy: "Same".into(),
             prefer_band: "5G".into(),
@@ -130,6 +132,19 @@ impl Settings {
                 if !s.internet_check {
                     s.internet_check = true;
                     INTERNET_CHECK_MIGRATED.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            // v1.2.0：回落更快。停滞阈值改为“距最后一次收到数据”的墙钟时间；断线让路 1200 → 400 ms。
+            // 只迁移还停留在旧默认值上的设置，用户自己改过的不动。
+            if s.schema_version < 5 {
+                if s.stall_ms == 1500 {
+                    s.stall_ms = 1000;
+                }
+                if s.heartbeat_ms == 2000 {
+                    s.heartbeat_ms = 1500;
+                }
+                if s.disc_grace_ms == 1200 {
+                    s.disc_grace_ms = 400;
                 }
             }
             s.schema_version = CURRENT_SCHEMA;

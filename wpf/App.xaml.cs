@@ -55,6 +55,9 @@ namespace WifiPriority
 
         protected override void OnStartup(StartupEventArgs e)
         {
+            // v1.2.0 降低内存：界面很简单，用不着 D3D 硬件加速；软件渲染可以省掉 GPU 相关的显存映射和 D3D 设备（几十 MB 工作集）
+            System.Windows.Media.RenderOptions.ProcessRenderMode = System.Windows.Interop.RenderMode.SoftwareOnly;
+
             base.OnStartup(e);
 
             bool background = e.Args.Any(a => a.Equals("--background", StringComparison.OrdinalIgnoreCase));

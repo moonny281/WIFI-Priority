@@ -9,6 +9,7 @@ mod freshness;
 mod link;
 mod model;
 mod native;
+mod nativeov;
 mod netsh;
 mod ops;
 mod overlay;
@@ -40,6 +41,7 @@ struct TauriHost {
 impl Host for TauriHost {
     fn on_status(&self, s: &EngineStatus) {
         let _ = self.app.emit("status", s);
+        nativeov::on_status(s); // 原生悬浮框（没有就只是缓存）
         tray::update(&self.app, s);
     }
 
@@ -65,6 +67,7 @@ impl Host for TauriHost {
 
 fn main() {
     util::now_ms(); // 启动单调时钟
+    util::lower_memory_priority(); // 内存紧张时优先回收本进程不用的页（不影响 CPU 优先级）
     let background = std::env::args().any(|a| a == "--background");
     let shared = Arc::new(Shared::new(util::load_settings()));
     let shared_exit = shared.clone();

@@ -79,6 +79,7 @@ const TEMPLATE = `
       <div class="card">
         <label class="switch"><input type="checkbox" data-setting="OverlayEnabled" /><span>显示桌面悬浮框</span></label>
         <label class="switch"><input type="checkbox" data-setting="OverlayShowSignal" /><span>显示信号强度</span></label>
+        <label class="switch"><input type="checkbox" data-setting="OverlayNative" /><span>原生悬浮框（不使用 WebView2，后台内存占用低很多，推荐；关闭则使用网页版悬浮框）</span></label>
         <label class="switch"><input type="checkbox" data-setting="OverlayShowTraffic" /><span>显示实时流量：↓↑ 速度，以及 本次连接 / 该网络今日 / 该网络累计 用量</span></label>
         <label class="switch"><input type="checkbox" data-setting="OverlayLocked" /><span>锁定位置并鼠标穿透（悬浮框不再响应点击，需在此处或托盘菜单解锁）</span></label>
       </div>

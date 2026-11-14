@@ -63,10 +63,10 @@ namespace WifiPriority.Services
 
         // ---- 每次连接一份状态 ----
         string _ssid;
-        long _connAt, _lastTick, _lastRx, _stall, _nextHb, _nextWan, _badSince, _healthySince, _recheckAt;
+        long _connAt, _lastRx, _outSinceRx, _nextHb, _nextWan, _badSince, _healthySince, _recheckAt;
         long _inPrev = -1, _outPrev = -1;
         int _wanFail;
-        bool _gwNoIcmp, _reported;
+        bool _gwNoIcmp, _gwIcmpSeen, _reported;   // _gwIcmpSeen：这次连接里网关回过 ICMP，之后 ICMP 连续不通就直接判死
         IPAddress _gw;
         NetworkInterface _ni;
         long _niAt = -100000;
@@ -75,11 +75,11 @@ namespace WifiPriority.Services
         void Reset(CurLink c, long now)
         {
             _ssid = c.Ssid; _connAt = c.ConnectedAt;
-            _lastTick = now; _lastRx = now;
-            _stall = _nextHb = _nextWan = _badSince = _healthySince = _recheckAt = 0;
+            _lastRx = now;
+            _outSinceRx = _nextHb = _nextWan = _badSince = _healthySince = _recheckAt = 0;
             _inPrev = _outPrev = -1;
             _wanFail = 0;
-            _gwNoIcmp = _reported = false;
+            _gwNoIcmp = _gwIcmpSeen = _reported = false;
             _gw = null; _ni = null; _niAt = -100000;
         }
 
@@ -113,7 +113,7 @@ namespace WifiPriority.Services
                         {
                             _reported = true; _healthySince = 0;
                             string why = v == Verdict.NoInternet ? "已连接，网关可达但公网不通" : _why;
-                            string took = _badSince > 0 ? $"发现异常后 {now - _badSince} ms 判定" : "即时判定";
+                            string took = _badSince > 0 ? $"距最后一次收到数据 {now - _badSince} ms 判定" : "即时判定";
                             ReportUnusable?.Invoke(_ssid, why, took);
                         }
                         _recheckAt = now + 2000;
@@ -140,17 +140,11 @@ namespace WifiPriority.Services
             try { stats = _ni.GetIPStatistics(); }
             catch { return Verdict.Pending; }
             long inB = stats.BytesReceived, outB = stats.BytesSent;
-            long dt = Math.Min(Math.Max(now - _lastTick, 1), 1000);
-            _lastTick = now;
             if (_inPrev >= 0)
             {
                 long dIn = inB - _inPrev, dOut = outB - _outPrev;
-                if (dIn > 0) { _stall = 0; _lastRx = now; }
-                else if (dOut >= 256)
-                {
-                    _stall += dt;                            // 发了包，却一个字节都没收到
-                    if (_badSince == 0) _badSince = now;
-                }
+                if (dIn > 0) { _lastRx = now; _outSinceRx = 0; _badSince = 0; }
+                else if (dOut > 0) _outSinceRx += dOut;
             }
             else _lastRx = now;
             _inPrev = inB; _outPrev = outB;
@@ -167,30 +161,44 @@ namespace WifiPriority.Services
                     return Verdict.Pending;
                 }
                 _nextWan = now;   // 网关一就绪就立刻验一次公网
+                // 顺便 ping 一次网关：回过 ICMP 的网关，之后 ICMP 不通就是真的不通（快速判死）；不回的网关走保守流程
+                if (await PingAsync(_gw, 300)) { _gwIcmpSeen = true; _lastRx = now; }
             }
 
             int ifIndex;
             try { ifIndex = _ni.GetIPProperties().GetIPv4Properties().Index; }
             catch { return Verdict.Pending; }
 
-            bool suspect = _stall >= _s.StallMs;
-            bool idleHb = now >= _nextHb && now - _lastRx >= _s.HeartbeatMs;   // 有入站流量就不用心跳
-            bool silentHb = (GetSilent?.Invoke() ?? false) && now >= _nextHb;  // 接入点静默：每个心跳周期去确认一次网关
+            // 起点是“最后一次收到数据”（墙钟），不是“发现异常的那一拍”：真实断线到判死的时间才算得准
+            long sinceRx = now - _lastRx;
+            // 发了东西（>= 256 字节）却已经 StallMs 没有任何回音 → 怀疑；完全空闲时由心跳兜底
+            bool suspect = sinceRx >= _s.StallMs && _outSinceRx >= 256;
+            bool silent = GetSilent?.Invoke() ?? false;
+            bool probeDue = suspect || (now >= _nextHb && (sinceRx >= _s.HeartbeatMs || silent));
             bool gwAlive = false;
 
-            // —— L2-①：网关 ICMP（只在怀疑 / 空闲心跳时）——
-            if ((suspect || idleHb || silentHb) && !_gwNoIcmp)
+            // —— L2-①：网关 ICMP ——
+            if (probeDue && !_gwNoIcmp)
             {
                 _nextHb = now + _s.HeartbeatMs;
-                gwAlive = await PingAsync(_gw, 400) || await PingAsync(_gw, 400);
-                if (gwAlive) { _stall = 0; _badSince = 0; }
+                int pm = _gwIcmpSeen ? 300 : 400;
+                gwAlive = await PingAsync(_gw, pm) || await PingAsync(_gw, pm);
+                if (gwAlive)
+                {
+                    _gwIcmpSeen = true; _lastRx = now; _outSinceRx = 0; _badSince = 0;   // 网关回了应答，链路是活的
+                }
+                else if (_gwIcmpSeen)
+                {
+                    // 这个网关此前回过 ICMP，现在连续不通：直接判死，不再串行等公网复核（省约 0.9 秒）
+                    _badSince = _lastRx; _why = "网关不再应答（此前应答过）"; return Verdict.LinkDead;
+                }
                 else if (await WanOkAsync(ifIndex, _s.WanTimeoutMs))
                 {
                     // 网关不回 ICMP（部分热点 / 访客网络），但公网是通的：记住，别再用 ICMP 判死
-                    _gwNoIcmp = true; _stall = 0; _badSince = 0;
+                    _gwNoIcmp = true; _lastRx = now; _outSinceRx = 0; _badSince = 0;
                     return Verdict.Healthy;
                 }
-                else { _why = "入站停滞且网关无响应"; return Verdict.LinkDead; }
+                else { _badSince = _lastRx; _why = "入站停滞且网关无响应"; return Verdict.LinkDead; }
             }
 
             // —— L2-②：公网（到期，或刚被怀疑过）——
@@ -198,7 +206,7 @@ namespace WifiPriority.Services
             {
                 if (await WanOkAsync(ifIndex, _s.WanTimeoutMs))
                 {
-                    _wanFail = 0; _stall = 0; _badSince = 0;
+                    _wanFail = 0; _lastRx = now; _outSinceRx = 0; _badSince = 0;
                     _nextWan = now + _s.WanIntervalSec * 1000L;
                     return Verdict.Healthy;
                 }
@@ -209,7 +217,7 @@ namespace WifiPriority.Services
             }
 
             // 两次探测之间：没有任何异常迹象 → 沿用“健康”
-            if (_wanFail == 0 && _stall == 0 && _badSince == 0 && now < _nextWan) return Verdict.Healthy;
+            if (_wanFail == 0 && _badSince == 0 && now < _nextWan) return Verdict.Healthy;
             return Verdict.Pending;
         }
 

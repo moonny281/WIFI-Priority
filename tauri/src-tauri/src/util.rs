@@ -78,6 +78,22 @@ extern "system" {
     fn K32EmptyWorkingSet(process: isize) -> i32;
 }
 
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn SetProcessInformation(process: isize, class: i32, info: *const std::ffi::c_void, size: u32) -> i32;
+}
+
+/// 把本进程的“内存优先级”调低（ProcessMemoryPriority = 0，MEMORY_PRIORITY_LOW = 2）：
+/// 系统内存紧张时会优先回收本进程暂时不用的页。只影响内存页的回收顺序，不改 CPU 优先级，不影响响应速度。
+pub fn lower_memory_priority() {
+    #[cfg(windows)]
+    unsafe {
+        let v: u32 = 2;
+        SetProcessInformation(GetCurrentProcess(), 0, &v as *const u32 as *const std::ffi::c_void, 4);
+    }
+}
+
 /// 收缩本进程的工作集：把暂时用不到的页换出去，任务管理器里的“内存”会明显降下来（用到时再按需换回）。
 pub fn trim_memory() {
     #[cfg(windows)]

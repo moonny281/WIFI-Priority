@@ -3,8 +3,9 @@
 //! 每个 Tauri 窗口都带一个 WebView2 渲染进程（每个几十 MB）。旧版启动时就创建主窗口和悬浮框，
 //! 关闭主窗口也只是隐藏——所以“只在托盘里待着”时仍然占着两个 WebView。现在：
 //!  - 主窗口只在需要时创建，点关闭就真正销毁（WebView2 进程随之退出）；
-//!  - 悬浮框只在开启时创建，关闭悬浮框就销毁；
-//!  - 两个窗口都没有时，后台只剩 Rust 引擎本身（几 MB）。
+//!  - v1.2.0：悬浮框默认改为原生（GDI）窗口（见 nativeov.rs），完全不需要 WebView2；
+//!    这里的网页版悬浮框只在设置里关闭了“原生悬浮框”或原生窗口创建失败时才会创建；
+//!  - 主窗口没打开、悬浮框是原生的时候，后台只剩 Rust 引擎本身（几 MB）。
 //! 创建窗口一律放到单独线程里做：Windows 上在主线程（同步命令 / 事件回调里）直接 build() 会死锁。
 //! 两个窗口的 WebView2 启动参数必须完全一致（同一个用户数据目录的环境选项不一致会创建失败）。
 
@@ -16,8 +17,8 @@ use tauri::window::{Effect, EffectsBuilder};
 use tauri::{AppHandle, Manager, Theme, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 /// 在 Tauri 默认参数基础上限制 V8 堆，并让渲染进程数量尽量少（界面很简单，用不着多进程）。
-pub const WV_ARGS: &str =
-    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --js-flags=--max-old-space-size=48 --renderer-process-limit=1";
+pub const WV_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
+--js-flags=--max-old-space-size=48 --renderer-process-limit=1 --in-process-gpu --disable-background-networking";
 
 fn apply_theme(app: &AppHandle, sh: &Arc<Shared>) {
     let theme = match sh.settings.lock().unwrap().theme.as_str() {

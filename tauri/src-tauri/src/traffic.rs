@@ -399,6 +399,7 @@ pub fn spawn(app: AppHandle, sh: Arc<Shared>, cur: Arc<Mutex<Option<CurLink>>>) 
             cmp.sess_secs = last_emit.sess_secs;
             if fast && cmp != last_emit {
                 let _ = app.emit("traffic", &snap);
+                crate::nativeov::on_traffic(&snap); // 原生悬浮框
             }
             last_emit = snap;
         }

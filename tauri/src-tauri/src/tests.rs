@@ -41,6 +41,7 @@ fn cfg(policy: &str, prefer: &str, confirm: i64, pri: &[&str]) -> Settings {
     s.confirm_ms = confirm;
     s.cooldown_sec = 8;
     s.min_connect_signal = 0; // 旧用例不涉及“最低连接信号”，新用例自己设置
+    s.disc_grace_ms = 1200;   // 旧用例按 1200 ms 的让路时间写的；新默认值 400 ms 见 s7
     s.priorities = pri.iter().map(|x| x.to_string()).collect();
     s
 }
@@ -686,35 +687,48 @@ fn l2_dhcp_timeout_replaces_fixed_12s_wait() {
 }
 
 #[test]
-fn l3_rx_stall_then_gateway_dead_is_detected_in_about_1_5s() {
+fn l3_no_reply_for_stall_ms_then_gateway_silent_is_dead_in_about_1s() {
     let hw = fake();
-    let s = Settings::fresh(); // stall_ms = 1500
+    let s = Settings::fresh(); // stall_ms = 1000：从“最后一次收到数据”起算（墙钟）
     let mut st = LinkState::new("X", 0, 0);
-    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 0, false), Verdict::Healthy); // 网关就绪后立刻验证公网
+    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 0, false), Verdict::Healthy); // 网关就绪：ping 过一次（应答），公网也通
     // 之后一直在发包（out 增长），却一个字节都没收到
-    for t in [250, 500, 750, 1000, 1250] {
+    for t in [250, 500, 750] {
         let mut sn = hw.snap.get();
         sn.out_octets += 1000;
         hw.snap.set(sn);
-        // 停滞还没到阈值：没有新结论（Pending），但绝不能判死
         assert!(matches!(link::evaluate(&hw, &mut st, &G, &s, t, false), Verdict::Pending | Verdict::Healthy), "t={}", t);
     }
     let mut sn = hw.snap.get();
     sn.out_octets += 1000;
     hw.snap.set(sn);
+    hw.ping_ok.set(false); // 热点没了：网关不再应答，公网也不通
+    hw.wan.set(false);
+    // 1000 ms 没有回音 → 怀疑 → 网关此前回过 ICMP，现在不通 → 直接判死（不再串行等公网复核）
+    assert!(matches!(link::evaluate(&hw, &mut st, &G, &s, 1000, false), Verdict::LinkDead(_)));
+}
+
+#[test]
+fn l3b_idle_link_uses_heartbeat_not_traffic() {
+    let hw = fake();
+    let s = Settings::fresh(); // heartbeat_ms = 1500
+    let mut st = LinkState::new("X", 0, 0);
+    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 0, false), Verdict::Healthy);
     hw.ping_ok.set(false);
     hw.wan.set(false);
+    // 完全空闲（没有发出任何东西）：1500 ms 没收到任何数据后用心跳去确认网关
+    assert!(!matches!(link::evaluate(&hw, &mut st, &G, &s, 1000, false), Verdict::LinkDead(_)));
     assert!(matches!(link::evaluate(&hw, &mut st, &G, &s, 1500, false), Verdict::LinkDead(_)));
 }
 
 #[test]
 fn l4_gateway_ignores_icmp_but_wan_ok_is_not_dead() {
     let hw = fake();
+    hw.ping_ok.set(false); // 这个网关从来不回 ICMP（公网是通的）
     let s = Settings::fresh();
     let mut st = LinkState::new("X", 0, 0);
     assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 0, false), Verdict::Healthy);
-    hw.ping_ok.set(false); // 网关不回 ICMP，但公网通
-    for t in [250, 500, 750, 1000, 1250] {
+    for t in [250, 500, 750] {
         let mut sn = hw.snap.get();
         sn.out_octets += 1000;
         hw.snap.set(sn);
@@ -723,8 +737,8 @@ fn l4_gateway_ignores_icmp_but_wan_ok_is_not_dead() {
     let mut sn = hw.snap.get();
     sn.out_octets += 1000;
     hw.snap.set(sn);
-    // 停滞达到阈值：网关 ICMP 不通，但公网通 → 判健康，并记住该网关不回 ICMP
-    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 1500, false), Verdict::Healthy);
+    // 没有回音达到阈值：ICMP 不通，但此前也从没应答过 → 走保守流程：公网通 → 判健康，并记住该网关不回 ICMP
+    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 1000, false), Verdict::Healthy);
     assert!(st.gw_no_icmp);
 }
 
@@ -794,7 +808,12 @@ fn s7_internet_check_default_on_migration() {
     // 新版本里用户自己关掉的，不再被改回来
     let s = Settings::from_json(r#"{"SchemaVersion":4,"InternetCheck":false}"#).unwrap();
     assert!(!s.internet_check);
-    assert_eq!(s.disc_grace_ms, 1200);
+    assert_eq!(s.disc_grace_ms, 400);
+    // v1.2.0 迁移：还停留在旧默认值上的设置改成新默认值；用户自己改过的不动
+    let s = Settings::from_json(r#"{"SchemaVersion":4,"StallMs":1500,"HeartbeatMs":2000,"DiscGraceMs":1200}"#).unwrap();
+    assert_eq!((s.stall_ms, s.heartbeat_ms, s.disc_grace_ms), (1000, 1500, 400));
+    let s = Settings::from_json(r#"{"SchemaVersion":4,"StallMs":3000,"DiscGraceMs":2000}"#).unwrap();
+    assert_eq!((s.stall_ms, s.disc_grace_ms), (3000, 2000));
 }
 
 // ---------------- v1.1.9：热点开/关要立刻反应、流量计费 ----------------
@@ -914,4 +933,32 @@ fn tr1_traffic_split_by_connection_and_network() {
     let s6 = a.feed(None, &read, 6000, "2026-11-14", 106);
     assert!(!s6.connected);
     assert_eq!(a.store.recent.len(), 2);
+}
+
+// ---------------- v1.2.0：回落更快 ----------------
+#[test]
+fn t30_link_monitor_verdict_skips_confirm_delay() {
+    // 确认时间故意设得很长：链路监视已经用多层证据判死了当前网络，回落不该再等确认
+    let mut d = Decider::new();
+    let s = cfg("Same", "5G", 5000, &["Hotspot", "Home"]);
+    let w = st(Some(("Hotspot", 2, 80)), &[("Hotspot", 2, 80), ("Home", 2, 70)]);
+    assert!(d.decide(&w, &s, 1000, false).connect.is_none()); // 一切正常
+    d.report_no_internet("Hotspot"); // 链路监视判死
+    let p = d.decide(&w, &s, 1100, false).connect.expect("判死后应立即回落，不等确认时间");
+    assert_eq!(p.ssid, "Home");
+}
+
+#[test]
+fn t31_reappearing_network_clears_its_backoff() {
+    // 热点被判死后写了 15 秒退避；它消失又重新出现（用户关了又开）= 重启过，退避作废，立即连
+    let mut d = Decider::new();
+    let s = cfg("Same", "5G", 0, &["Hotspot", "Home"]);
+    d.unusable_handle().lock().unwrap().insert("Hotspot".to_string(), Unusable { until: 100_000, level: 1 });
+    let w1 = st(Some(("Home", 2, 70)), &[("Hotspot", 2, 80), ("Home", 2, 70)]);
+    assert!(d.decide(&w1, &s, 1000, false).connect.is_none()); // 退避期内：不当作切换目标
+    let w0 = st(Some(("Home", 2, 70)), &[("Home", 2, 70)]); // 热点消失
+    d.decide(&w0, &s, 2000, false);
+    let p = d.decide(&w1, &s, 3000, false).connect.expect("重新出现后应立即连接");
+    assert_eq!(p.ssid, "Hotspot");
+    assert!(d.unusable_handle().lock().unwrap().get("Hotspot").is_none());
 }

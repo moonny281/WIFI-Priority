@@ -316,6 +316,7 @@ impl Decider {
             let el = now - self.last_plan_at;
             if on_target && band_ok && !st.connecting {
                 self.last_plan = None; // 成功
+                d.logs.push(format!("已连上 {}（发出连接请求后 {} ms）", lp.to_label, el)); // 完整时间线：判定 → 发出请求 → 连上
             } else if (el >= SETTLE_MS || failed_fast) && !st.connecting {
                 if !on_target && lp.bssid.is_some() && !lp.retried {
                     // 指定接入点（BSSID）没连上：BSS 列表是缓存，那个接入点可能已经不在了。
@@ -424,6 +425,8 @@ impl Decider {
             for n in &vis_now {
                 if !first && !self.vis.contains(n) {
                     self.appeared.insert(n.clone(), now);
+                    // 消失后又重新出现 = 它重启过（热点关了又开）：之前判死的退避作废，不要再挡着不让连
+                    self.unusable.lock().unwrap().remove(n);
                 }
             }
             self.appeared.retain(|k, _| vis_now.contains(k));
@@ -598,7 +601,9 @@ impl Decider {
             self.pending_last_seen = now;
             let wait_confirm = now - self.pending_since < s.confirm_ms.max(0);
             let cooling = (cur_ok || !cur_listed) && now - self.last_switch < s.cooldown_sec.max(0) * 1000;
-            if (wait_confirm || cooling) && !appeared_recent {
+            // 链路监视已经用多层证据确认当前网络不可用：这是确凿的结论，不是信号抖动，不需要再等确认时间
+            let confirmed_dead = cur.is_some() && no_net.as_deref() == cur;
+            if (wait_confirm || cooling) && !appeared_recent && !confirmed_dead {
                 return d;
             }
         }

@@ -16,6 +16,7 @@ export interface Settings {
   InternetCheck: boolean;
   HuntScanMs: number;
   OverlayShowTraffic: boolean;
+  OverlayNative: boolean;
   StallMs: number;
   HeartbeatMs: number;
   WanIntervalSec: number;

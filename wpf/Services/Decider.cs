@@ -219,6 +219,7 @@ namespace WifiPriority.Services
                 long el = now - _lastPlanAt;
                 if (onTarget && bandOk && !st.Connecting)
                 {
+                    d.Logs.Add($"已连上 {_lastPlan.ToLabel}（发出连接请求后 {el} ms）");   // 完整时间线：判定 → 发出请求 → 连上
                     _lastPlan = null;                                   // 成功
                 }
                 else if ((el >= SettleMs || failedFast) && !st.Connecting)
@@ -307,7 +308,11 @@ namespace WifiPriority.Services
                 bool visFirst = !_visInit;
                 _visInit = true;
                 foreach (var vn in visNow)
-                    if (!visFirst && !_vis.Contains(vn)) _appeared[vn] = now;
+                    if (!visFirst && !_vis.Contains(vn))
+                    {
+                        _appeared[vn] = now;
+                        lock (_unusable) _unusable.Remove(vn);   // 消失后又重新出现 = 它重启过（热点关了又开）：之前判死的退避作废
+                    }
                 foreach (var vk in _appeared.Keys.Where(x => !visNow.Contains(x)).ToList()) _appeared.Remove(vk);
                 _vis = visNow;
             }
@@ -433,7 +438,9 @@ namespace WifiPriority.Services
                 _pendingLastSeen = now;
                 bool waitConfirm = now - _pendingSince < Math.Max(0, s.ConfirmMs);
                 bool cooling = (curOk || !curListed) && now - _lastSwitch < Math.Max(0, s.CooldownSec) * 1000L;
-                if ((waitConfirm || cooling) && !appearedRecent) return d;
+                // 链路监视已经用多层证据确认当前网络不可用：这是确凿的结论，不是信号抖动，不需要再等确认时间
+                bool confirmedDead = cur != null && _noNet == cur;
+                if ((waitConfirm || cooling) && !appearedRecent && !confirmedDead) return d;
             }
 
             string fromLabel = cur == null ? null : Label(cur, st.CurBand);

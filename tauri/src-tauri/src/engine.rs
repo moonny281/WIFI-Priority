@@ -96,7 +96,7 @@ struct Engine<H: Host> {
     last_scan_at: i64,
     connecting_seen_at: i64, // 最近一次看到“正在连接”的时间
     scan_busy: bool,
-    last_sig: String,
+    last_sig: u64, // 状态指纹（哈希）：每个 tick 都比较，不再拼接大字符串
     last_pub_at: i64,
     cur_ssid: Arc<Mutex<Option<String>>>, // 仅 netsh 兼容模式的旧联网检测使用
     cur_link: Arc<Mutex<Option<CurLink>>>, // 发布给链路监视线程：当前连接的 SSID / 网卡 GUID / 连接开始时间
@@ -123,7 +123,7 @@ impl<H: Host> Engine<H> {
             last_scan_at: -100_000,
             connecting_seen_at: 0,
             scan_busy: false,
-            last_sig: String::new(),
+            last_sig: 0,
             last_pub_at: 0,
             cur_ssid: Arc::new(Mutex::new(None)),
             cur_link,
@@ -437,18 +437,18 @@ impl<H: Host> Engine<H> {
         let paused = self.sh.is_paused();
         let target = self.dec.active_target();
         let connecting = st.connecting || target.is_some();
-        let sig = format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
-            st.connected,
-            st.ssid,
-            st.cur_band,
-            st.signal,
-            paused,
-            st.location_denied,
-            connecting,
-            target.as_deref().unwrap_or(""),
-            st.nearby.iter().map(|n| format!("{}:{}", n.ssid, n.signal)).collect::<Vec<_>>().join(",")
-        );
+        // 指纹用哈希算，不分配字符串（这段每 250–500 ms 就跑一次，附近网络多时拼字符串会反复分配、释放）
+        let sig = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (st.connected, &st.ssid, st.cur_band, st.signal, paused, st.location_denied, connecting).hash(&mut h);
+            target.as_deref().unwrap_or("").hash(&mut h);
+            for n in &st.nearby {
+                n.ssid.hash(&mut h);
+                n.signal.hash(&mut h);
+            }
+            h.finish()
+        };
         let now = now_ms();
         if !force && sig == self.last_sig && now - self.last_pub_at < 2000 {
             return;

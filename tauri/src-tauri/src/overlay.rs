@@ -8,14 +8,22 @@ use tauri::{AppHandle, LogicalSize, Manager, PhysicalPosition};
 
 /// 按当前设置应用：显示/隐藏、锁定（鼠标穿透）、位置。
 pub fn apply(app: &AppHandle, sh: &Arc<Shared>) {
-    let (enabled, locked) = {
+    let (enabled, locked, native_pref) = {
         let s = sh.settings.lock().unwrap();
-        (s.overlay_enabled, s.overlay_locked)
+        (s.overlay_enabled, s.overlay_locked, s.overlay_native)
     };
     if !enabled {
         crate::winmgr::close_overlay(app); // 不显示时直接销毁窗口，释放 WebView2 内存
+        crate::nativeov::close();
         return;
     }
+    // v1.2.0：优先用原生（GDI）悬浮框——不需要 WebView2，后台内存低得多；创建失败过才回退到网页版
+    if native_pref && !crate::nativeov::failed() {
+        crate::winmgr::close_overlay(app);
+        crate::nativeov::ensure(app, sh); // 已存在则通知它按最新设置刷新（位置 / 大小 / 透明度 / 锁定 / 层级）
+        return;
+    }
+    crate::nativeov::close();
     match app.get_webview_window("overlay") {
         Some(w) => {
             let _ = w.set_ignore_cursor_events(locked);
@@ -31,6 +39,10 @@ pub fn apply(app: &AppHandle, sh: &Arc<Shared>) {
 /// 置顶模式下会被定时重复调用（见 main.rs），因为别的置顶窗口出现后悬浮框不会自己回到最上面。
 pub fn apply_layer(app: &AppHandle, sh: &Arc<Shared>) {
     let top = sh.settings.lock().unwrap().overlay_layer != "Desktop";
+    if crate::nativeov::running() {
+        crate::nativeov::set_layer(top);
+        return;
+    }
     if let Some(w) = app.get_webview_window("overlay") {
         let _ = w.set_always_on_top(top);
         if let Ok(h) = w.hwnd() {

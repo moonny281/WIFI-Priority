@@ -161,7 +161,8 @@ pub fn wan_ok(if_index: u32, timeout: Duration) -> bool {
     let (tx, rx) = mpsc::channel();
     for ip in TARGETS {
         let tx = tx.clone();
-        std::thread::spawn(move || {
+        // 探测线程只做一次 connect，栈开小一点（默认 2 MB 的预留 + 提交对常驻内存没好处）
+        let _ = std::thread::Builder::new().stack_size(128 * 1024).spawn(move || {
             let _ = tx.send(tcp_ok_on_iface(if_index, ip, 443, timeout));
         });
     }
@@ -222,11 +223,11 @@ pub struct LinkState {
     pub ssid: String,
     pub connected_at: i64,
     prev: Option<IfSnapshot>,
-    last_tick: i64,
-    last_rx_at: i64,
-    pub stall_ms: i64,
+    last_rx_at: i64,       // 最后一次收到入站数据的时间（墙钟）——判断“多久没收到东西了”的起点
+    out_since_rx: u64,     // 最后一次入站之后发出去的字节数（发了东西却没有回音才算“怀疑”）
     gw: Option<Ipv4Addr>,
-    pub gw_no_icmp: bool, // 该网关不回 ICMP（但公网通）：之后不再用 ICMP 做心跳，避免误判
+    pub gw_icmp_seen: bool, // 这次连接里网关回过 ICMP：之后 ICMP 连续不通就直接判死，不再串行等公网复核
+    pub gw_no_icmp: bool,   // 该网关不回 ICMP（但公网通）：之后不再用 ICMP 做心跳，避免误判
     next_hb_at: i64,
     next_wan_at: i64,
     wan_fail: u32,
@@ -241,7 +242,6 @@ impl LinkState {
         LinkState {
             ssid: ssid.to_string(),
             connected_at,
-            last_tick: now,
             last_rx_at: now,
             ..Default::default()
         }
@@ -259,20 +259,16 @@ pub fn evaluate<H: Hw>(hw: &H, st: &mut LinkState, guid: &[u8; 16], s: &Settings
     if !snap.oper_up || !snap.media_up {
         return Verdict::LinkDead("网卡/驱动报告链路已断开");
     }
-    let dt = (now - st.last_tick).clamp(1, 1000);
-    st.last_tick = now;
     match &st.prev {
         Some(p) => {
             let d_in = snap.in_octets.saturating_sub(p.in_octets);
             let d_out = snap.out_octets.saturating_sub(p.out_octets);
             if d_in > 0 {
-                st.stall_ms = 0;
                 st.last_rx_at = now;
-            } else if d_out >= 256 {
-                st.stall_ms += dt; // 发了包，却一个字节都没收到
-                if st.bad_since == 0 {
-                    st.bad_since = now;
-                }
+                st.out_since_rx = 0;
+                st.bad_since = 0;
+            } else {
+                st.out_since_rx = st.out_since_rx.saturating_add(d_out);
             }
         }
         None => st.last_rx_at = now,
@@ -290,29 +286,45 @@ pub fn evaluate<H: Hw>(hw: &H, st: &mut LinkState, guid: &[u8; 16], s: &Settings
             };
         }
         st.next_wan_at = now; // 网关一就绪就立刻验一次公网
+        // 顺便 ping 一次网关：回过 ICMP 的网关，之后 ICMP 不通就是真的不通（快速判死）；不回的网关走保守流程
+        if hw.ping(st.gw.unwrap(), 300) {
+            st.gw_icmp_seen = true;
+            st.last_rx_at = now;
+        }
     }
     let gw = st.gw.unwrap();
 
-    let suspect = st.stall_ms >= s.stall_ms;
-    let idle_hb = now >= st.next_hb_at && now - st.last_rx_at >= s.heartbeat_ms; // 有入站流量就不用心跳
-    let silent_hb = silent && now >= st.next_hb_at; // 接入点静默：不管有没有入站流量，每个心跳周期去确认一次网关
+    // 起点是“最后一次收到数据”（墙钟），不是“发现异常的那一拍”：真实断线到判死的时间才算得准
+    let since_rx = now - st.last_rx_at;
+    // 发了东西（>= 256 字节）却已经 stall_ms 没有任何回音 → 怀疑；完全空闲时由心跳兜底
+    let suspect = since_rx >= s.stall_ms && st.out_since_rx >= 256;
     let wan_timeout = Duration::from_millis(s.wan_timeout_ms.max(1) as u64);
+    let probe_due = suspect || (now >= st.next_hb_at && (since_rx >= s.heartbeat_ms || silent));
     let mut gw_alive = false;
 
-    // —— L2-①：网关 ICMP（只在怀疑 / 空闲心跳时）——
-    if (suspect || idle_hb || silent_hb) && !st.gw_no_icmp {
+    // —— L2-①：网关 ICMP ——
+    if probe_due && !st.gw_no_icmp {
         st.next_hb_at = now + s.heartbeat_ms;
-        gw_alive = hw.ping(gw, 400) || hw.ping(gw, 400);
+        let pm = if st.gw_icmp_seen { 300 } else { 400 };
+        gw_alive = hw.ping(gw, pm) || hw.ping(gw, pm);
         if gw_alive {
-            st.stall_ms = 0;
+            st.gw_icmp_seen = true;
+            st.last_rx_at = now; // 网关回了应答，链路是活的
+            st.out_since_rx = 0;
             st.bad_since = 0;
+        } else if st.gw_icmp_seen {
+            // 这个网关此前回过 ICMP，现在连续不通：直接判死，不再串行等公网复核（省约 0.9 秒）
+            st.bad_since = st.last_rx_at;
+            return Verdict::LinkDead("网关不再应答（此前应答过）");
         } else if hw.wan_ok(snap.if_index, wan_timeout) {
             // 网关不回 ICMP（部分热点 / 访客网络），但公网是通的：记住，别再用 ICMP 判死
             st.gw_no_icmp = true;
-            st.stall_ms = 0;
+            st.last_rx_at = now;
+            st.out_since_rx = 0;
             st.bad_since = 0;
             return Verdict::Healthy;
         } else {
+            st.bad_since = st.last_rx_at;
             return Verdict::LinkDead("入站停滞且网关无响应");
         }
     }
@@ -321,7 +333,8 @@ pub fn evaluate<H: Hw>(hw: &H, st: &mut LinkState, guid: &[u8; 16], s: &Settings
     if now >= st.next_wan_at || (suspect && (gw_alive || st.gw_no_icmp)) {
         if hw.wan_ok(snap.if_index, wan_timeout) {
             st.wan_fail = 0;
-            st.stall_ms = 0;
+            st.last_rx_at = now; // 公网通：链路是活的
+            st.out_since_rx = 0;
             st.bad_since = 0;
             st.next_wan_at = now + s.wan_interval_sec * 1000;
             return Verdict::Healthy;
@@ -335,7 +348,7 @@ pub fn evaluate<H: Hw>(hw: &H, st: &mut LinkState, guid: &[u8; 16], s: &Settings
             return Verdict::NoInternet;
         }
     }
-    if st.wan_fail == 0 && st.stall_ms == 0 && st.gw.is_some() && st.bad_since == 0 && now < st.next_wan_at {
+    if st.wan_fail == 0 && st.gw.is_some() && st.bad_since == 0 && now < st.next_wan_at {
         // 两次探测之间：沿用“健康”
         return Verdict::Healthy;
     }
@@ -425,7 +438,7 @@ pub fn spawn_monitor(
                     *no_net.lock().unwrap() = Some(c.ssid.clone());
                     sh.urgent_scan.store(true, Ordering::Relaxed); // 立刻扫描，别等 scan_interval
                     let took = if st.bad_since > 0 {
-                        format!("发现异常后 {} ms 判定", now - st.bad_since)
+                        format!("距最后一次收到数据 {} ms 判定", now - st.bad_since)
                     } else {
                         "即时判定".to_string()
                     };
