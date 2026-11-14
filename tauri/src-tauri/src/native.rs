@@ -149,6 +149,8 @@ pub struct Client {
     profiles: HashSet<String>,
     profiles_at: Option<Instant>,
     pub broken: bool,
+    /// 本轮里耗时异常（> 800 ms）的 WLAN 调用，引擎读走后写进日志：WLAN 服务 / 驱动忙的时候这些调用会阻塞好几秒
+    pub slow: Vec<String>,
 }
 
 // 句柄只在引擎线程里使用；通知回调通过全局 Sender 通信
@@ -171,6 +173,7 @@ impl Client {
                 h,
                 ifaces: Vec::new(),
                 iface_at: Instant::now(),
+                slow: Vec::new(),
                 profiles: HashSet::new(),
                 profiles_at: None,
                 broken: false,
@@ -304,7 +307,11 @@ impl Client {
                 // 1) 当前连接
                 let mut data: *mut c_void = null_mut();
                 let mut size = 0u32;
+                let t_q = Instant::now();
                 let r = WlanQueryInterface(self.h, g.as_ptr(), 7, null_mut(), &mut size, &mut data, null_mut());
+                if t_q.elapsed().as_millis() > 800 {
+                    self.slow.push(format!("WlanQueryInterface(当前连接) {} ms", t_q.elapsed().as_millis()));
+                }
                 if r == ERR_ACCESS_DENIED {
                     st.location_denied = true;
                 } else if r == 0 && !data.is_null() {
@@ -335,7 +342,11 @@ impl Client {
                 // 2) 已保存配置名（可见网络自带 profile 名，比 SSID 对应关系更准）
                 let mut prof_by_ssid: HashMap<String, String> = HashMap::new();
                 let mut alist: *mut c_void = null_mut();
+                let t_a = Instant::now();
                 let r2 = WlanGetAvailableNetworkList(self.h, g.as_ptr(), 0, null_mut(), &mut alist);
+                if t_a.elapsed().as_millis() > 800 {
+                    self.slow.push(format!("WlanGetAvailableNetworkList {} ms", t_a.elapsed().as_millis()));
+                }
                 if r2 == ERR_ACCESS_DENIED {
                     st.location_denied = true;
                 } else if r2 == 0 && !alist.is_null() {
@@ -356,7 +367,11 @@ impl Client {
 
                 // 3) BSSID 列表：信号、频率（→ 频段）
                 let mut blist: *mut c_void = null_mut();
+                let t_b = Instant::now();
                 let r3 = WlanGetNetworkBssList(self.h, g.as_ptr(), null_mut(), 3, 0, null_mut(), &mut blist);
+                if t_b.elapsed().as_millis() > 800 {
+                    self.slow.push(format!("WlanGetNetworkBssList {} ms", t_b.elapsed().as_millis()));
+                }
                 if r3 == ERR_ACCESS_DENIED {
                     st.location_denied = true;
                 } else if r3 == 0 && !blist.is_null() {

@@ -67,7 +67,7 @@ namespace WifiPriority.Services
         string _skipSsid;           // 断网状态下刚连失败的网络：15 秒内先试下一个，别在断网时只盯着它死磕（连上任何网络后失效）
         long _skipUntil;
         // v1.1.8：链路监视确认“不可用”的网络 → 带指数退避的“暂不重试”（until 之前不当作切换目标，之后立即恢复，不是永久拉黑）
-        readonly Dictionary<string, (long Until, int Level)> _unusable = new Dictionary<string, (long Until, int Level)>();
+        readonly Dictionary<string, (long Until, int Level, long DeadAt)> _unusable = new Dictionary<string, (long Until, int Level, long DeadAt)>();   // DeadAt：判死的时间，退避期过了还要看到它在这之后又被扫描更新过
         // v1.1.9：热点“刚出现”/“刚关掉”要立刻反应
         bool _visInit;                                   // 是否已经有过一轮可见性记录（程序刚启动时已在场的网络不算“刚出现”）
         HashSet<string> _vis = new HashSet<string>();    // 上一轮可见（未过期）的列表内网络
@@ -88,7 +88,7 @@ namespace WifiPriority.Services
             {
                 int level = _unusable.TryGetValue(ssid, out var u) ? u.Level + 1 : 0;
                 wait = Backoff(baseSec, level);
-                _unusable[ssid] = (now + wait, level);
+                _unusable[ssid] = (now + wait, level, now);
             }
             _noNet = ssid;
             return wait;
@@ -109,6 +109,14 @@ namespace WifiPriority.Services
         }
 
         /// <summary>引擎收到驱动的“连接请求失败”通知（ACM 11）：不再等满 SettleMs，下一轮评估就按失败处理。</summary>
+        /// <summary>这个候选的接入点在 t 时刻之后还没有被扫描更新过（= 可能已经不在了）。与“断开后拉黑”同一套判据。</summary>
+        static bool UnseenSince(Cand c, long t, long now)
+        {
+            if (c.SeenAt > 0) return c.SeenAt <= t;
+            if (c.SeenAt < 0) return now - t < 20000;   // 驱动没给时间戳，无法求证：退化为 20 秒间隔
+            return true;                                // 0 = 启动时缓存里的、从未观察到更新：不算证据
+        }
+
         /// <summary>引擎收到“扫描完成”通知：断线后用它判断原网络是不是真的没了（热点被关）。</summary>
         public void NoteScanDone(long now) { _scanDoneAt = now; }
 
@@ -328,10 +336,12 @@ namespace WifiPriority.Services
                 if (c.SeenAt < 0) return now - blockedAt < 20000;    // 驱动没给时间戳，无法求证：退化为 20 秒间隔
                 return true;                                 // 0 = 启动时缓存里的、从未观察到更新：不算证据
             }
-            Dictionary<string, (long Until, int Level)> unusable;
-            lock (_unusable) unusable = new Dictionary<string, (long Until, int Level)>(_unusable);
+            Dictionary<string, (long Until, int Level, long DeadAt)> unusable;
+            lock (_unusable) unusable = new Dictionary<string, (long Until, int Level, long DeadAt)>(_unusable);
             // 判死过的网络：退避期内不当作切换目标（当前连着的由 _noNet 负责）
-            bool InBackoff(Cand c) => !IsCurrent(c) && unusable.TryGetValue(c.Ssid, out var u) && u.Until > now;
+            // 判死过的网络：退避期内不当作切换目标；退避期过了还要求它在判死之后又被扫描更新过（热点关掉后，
+            // 缓存里的旧条目要好几次扫描才会过期，不能因为退避到期就去连一个已经不在的幽灵）。当前连着的由 _noNet 负责。
+            bool InBackoff(Cand c) => !IsCurrent(c) && unusable.TryGetValue(c.Ssid, out var u) && (u.Until > now || UnseenSince(c, u.DeadAt, now));
             bool IsBad(Cand c) => IsBadKey(c.Key, now) || (_noNet != null && c.Ssid == _noNet) || Blocked(c) || InBackoff(c)
                 || (cur == null && _skipSsid != null && c.Ssid == _skipSsid && now < _skipUntil);
 

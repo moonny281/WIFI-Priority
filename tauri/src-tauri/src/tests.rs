@@ -666,14 +666,23 @@ fn fake() -> FakeHw {
 const G: [u8; 16] = [0; 16];
 
 #[test]
-fn l1_media_down_is_dead_immediately() {
+fn l1_media_down_alone_is_not_a_verdict_until_it_persists() {
+    // 我们自己切换网络时旧连接必然短暂掉线：链路断开不能一出现就判死（否则会把刚离开的好网络写进退避）
     let hw = fake();
     let s = Settings::fresh();
     let mut st = LinkState::new("X", 0, 0);
     let mut sn = hw.snap.get();
     sn.media_up = false;
     hw.snap.set(sn);
-    assert!(matches!(link::evaluate(&hw, &mut st, &G, &s, 100, false), Verdict::LinkDead(_)));
+    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 100, false), Verdict::Pending);
+    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 1500, false), Verdict::Pending);
+    // 持续 2 秒以上、引擎仍认为连着同一个网络：才算异常
+    assert!(matches!(link::evaluate(&hw, &mut st, &G, &s, 2200, false), Verdict::LinkDead(_)));
+    // 链路恢复：计时清零
+    let mut sn = hw.snap.get();
+    sn.media_up = true;
+    hw.snap.set(sn);
+    assert!(!matches!(link::evaluate(&hw, &mut st, &G, &s, 2400, false), Verdict::LinkDead(_)));
 }
 
 #[test]
@@ -794,7 +803,7 @@ fn t24_weak_signal_disconnect_does_not_wait_for_grace() {
 fn t25_unusable_backoff_blocks_target_then_expires() {
     let mut d = Decider::new();
     let s = cfg("Same", "5G", 0, &["Hotspot", "Home"]);
-    d.unusable_handle().lock().unwrap().insert("Hotspot".to_string(), Unusable { until: 10_000, level: 0 });
+    d.unusable_handle().lock().unwrap().insert("Hotspot".to_string(), Unusable { until: 10_000, level: 0, dead_at: 0 });
     let on_home = st(Some(("Home", 2, 70)), &[("Hotspot", 2, 80), ("Home", 2, 70)]);
     assert!(d.decide(&on_home, &s, 9000, false).connect.is_none()); // 退避期内：不把它当作切换目标
     assert_eq!(d.decide(&on_home, &s, 10_500, false).connect.map(|p| p.ssid), Some("Hotspot".to_string())); // 到期立即恢复
@@ -953,7 +962,7 @@ fn t31_reappearing_network_clears_its_backoff() {
     // 热点被判死后写了 15 秒退避；它消失又重新出现（用户关了又开）= 重启过，退避作废，立即连
     let mut d = Decider::new();
     let s = cfg("Same", "5G", 0, &["Hotspot", "Home"]);
-    d.unusable_handle().lock().unwrap().insert("Hotspot".to_string(), Unusable { until: 100_000, level: 1 });
+    d.unusable_handle().lock().unwrap().insert("Hotspot".to_string(), Unusable { until: 100_000, level: 1, dead_at: 0 });
     let w1 = st(Some(("Home", 2, 70)), &[("Hotspot", 2, 80), ("Home", 2, 70)]);
     assert!(d.decide(&w1, &s, 1000, false).connect.is_none()); // 退避期内：不当作切换目标
     let w0 = st(Some(("Home", 2, 70)), &[("Home", 2, 70)]); // 热点消失
@@ -961,4 +970,30 @@ fn t31_reappearing_network_clears_its_backoff() {
     let p = d.decide(&w1, &s, 3000, false).connect.expect("重新出现后应立即连接");
     assert_eq!(p.ssid, "Hotspot");
     assert!(d.unusable_handle().lock().unwrap().get("Hotspot").is_none());
+}
+
+// ---------------- v1.2.1：日志里的 bug ----------------
+#[test]
+fn t32_backoff_expiry_does_not_reconnect_to_ghost_that_was_never_seen_again() {
+    // 日志 13:33:15：热点已经关了，但缓存里的旧条目还没过期；退避 15 秒一到就切回热点，白白断网 10 秒。
+    // 现在：退避到期后还要求它在判死之后又被扫描更新过
+    let mut d = Decider::new();
+    let s = cfg("Same", "5G", 0, &["Hotspot", "Home"]);
+    d.unusable_handle().lock().unwrap().insert("Hotspot".to_string(), Unusable { until: 5_000, level: 0, dead_at: 4_000 });
+    let mut ghost = st(Some(("Home", 2, 70)), &[("Hotspot", 2, 80), ("Home", 2, 70)]);
+    for n in ghost.nearby.iter_mut() {
+        if n.ssid == "Hotspot" {
+            for b in n.bss.iter_mut() {
+                b.changed_at = 3_000; // 判死之前的最后一次更新：判死之后再没变化过 = 幽灵
+            }
+        }
+    }
+    assert!(d.decide(&ghost, &s, 20_000, false).connect.is_none()); // 退避早已到期，但没有新的证据
+    let mut alive = ghost.clone();
+    for n in alive.nearby.iter_mut() {
+        for b in n.bss.iter_mut() {
+            b.changed_at = 19_000; // 判死之后又被扫描更新过：真的还在
+        }
+    }
+    assert_eq!(d.decide(&alive, &s, 20_100, false).connect.map(|p| p.ssid), Some("Hotspot".to_string()));
 }

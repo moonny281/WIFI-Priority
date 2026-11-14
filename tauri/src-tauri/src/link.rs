@@ -223,6 +223,9 @@ pub struct LinkState {
     pub ssid: String,
     pub connected_at: i64,
     prev: Option<IfSnapshot>,
+    down_since: i64,       // 网卡报告链路断开的起始时间（0 = 没断）。主动切换网络时旧连接必然短暂掉线，不能一掉线就判死
+    seen_tries: u8,        // 试探“网关回不回 ICMP”的次数（最多 3 次）
+    next_seen_at: i64,
     last_rx_at: i64,       // 最后一次收到入站数据的时间（墙钟）——判断“多久没收到东西了”的起点
     out_since_rx: u64,     // 最后一次入站之后发出去的字节数（发了东西却没有回音才算“怀疑”）
     gw: Option<Ipv4Addr>,
@@ -257,8 +260,15 @@ pub fn evaluate<H: Hw>(hw: &H, st: &mut LinkState, guid: &[u8; 16], s: &Settings
         None => return Verdict::Pending,
     };
     if !snap.oper_up || !snap.media_up {
-        return Verdict::LinkDead("网卡/驱动报告链路已断开");
+        // 链路断开本身不是“网络不可用”：我们自己切换网络时，旧连接必然短暂掉线；用户手动换网、漫游也是。
+        // 真的断了 Windows 会报“已断开”，决策器走断线分支立刻处理。这里只兜底“驱动一直说已连接，但网卡链路持续断开”的异常：
+        // 持续 2 秒以上、而且引擎仍然认为连着同一个网络，才算。
+        if st.down_since == 0 {
+            st.down_since = now.max(1);
+        }
+        return if now - st.down_since >= 2000 { Verdict::LinkDead("网卡/驱动报告链路持续断开") } else { Verdict::Pending };
     }
+    st.down_since = 0;
     match &st.prev {
         Some(p) => {
             let d_in = snap.in_octets.saturating_sub(p.in_octets);
@@ -287,12 +297,23 @@ pub fn evaluate<H: Hw>(hw: &H, st: &mut LinkState, guid: &[u8; 16], s: &Settings
         }
         st.next_wan_at = now; // 网关一就绪就立刻验一次公网
         // 顺便 ping 一次网关：回过 ICMP 的网关，之后 ICMP 不通就是真的不通（快速判死）；不回的网关走保守流程
-        if hw.ping(st.gw.unwrap(), 300) {
+        st.seen_tries = 1;
+        st.next_seen_at = now + 1500;
+        if hw.ping(st.gw.unwrap(), 500) {
             st.gw_icmp_seen = true;
             st.last_rx_at = now;
         }
     }
     let gw = st.gw.unwrap();
+    // 刚连上时 ARP 还没解析好，第一次 ping 可能超时：之后再试几次（最多 3 次），这样“回过 ICMP 的网关”才能走快速判死
+    if !st.gw_icmp_seen && !st.gw_no_icmp && st.seen_tries < 3 && now >= st.next_seen_at {
+        st.seen_tries += 1;
+        st.next_seen_at = now + 2000;
+        if hw.ping(gw, 500) {
+            st.gw_icmp_seen = true;
+            st.last_rx_at = now;
+        }
+    }
 
     // 起点是“最后一次收到数据”（墙钟），不是“发现异常的那一拍”：真实断线到判死的时间才算得准
     let since_rx = now - st.last_rx_at;
@@ -392,6 +413,11 @@ pub fn spawn_monitor(
                 }
             };
             let now = now_ms();
+            // 程序刚发出连接请求（正在切换网络）：旧连接掉线是我们自己造成的，这段时间不评估、也不判死
+            if now < sh.switch_until.load(Ordering::Relaxed) {
+                st = LinkState::default();
+                continue;
+            }
             if st.ssid != c.ssid || st.connected_at != c.connected_at {
                 st = LinkState::new(&c.ssid, c.connected_at, now);
             }
@@ -424,7 +450,14 @@ pub fn spawn_monitor(
                 Verdict::Pending => None,
             };
 
-            if let Some(why) = dead_reason {
+            // 判定期间（探测可能花了一两秒）程序可能已经切走了：确认引擎当前连接仍然是这一个，才报告
+            let still_current = cur
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
+                .map_or(false, |x| x.ssid == c.ssid && x.connected_at == c.connected_at)
+                && now_ms() >= sh.switch_until.load(Ordering::Relaxed);
+            if let (Some(why), true) = (dead_reason, still_current) {
                 if !st.reported {
                     st.reported = true;
                     st.healthy_since = 0;
@@ -432,13 +465,14 @@ pub fn spawn_monitor(
                         let mut map = unusable.lock().unwrap();
                         let level = map.get(&c.ssid).map(|u| u.level + 1).unwrap_or(0);
                         let wait = backoff_ms(s.unusable_backoff_sec, level);
-                        map.insert(c.ssid.clone(), Unusable { until: now + wait, level });
+                        map.insert(c.ssid.clone(), Unusable { until: now + wait, level, dead_at: now });
                         (level, wait)
                     };
                     *no_net.lock().unwrap() = Some(c.ssid.clone());
                     sh.urgent_scan.store(true, Ordering::Relaxed); // 立刻扫描，别等 scan_interval
                     let took = if st.bad_since > 0 {
-                        format!("距最后一次收到数据 {} ms 判定", now - st.bad_since)
+                        // 用判定完成的时刻算（探测本身要花一两秒，不能用这一轮开始的时刻）
+                        format!("距最后一次收到数据 {} ms 判定", now_ms() - st.bad_since)
                     } else {
                         "即时判定".to_string()
                     };

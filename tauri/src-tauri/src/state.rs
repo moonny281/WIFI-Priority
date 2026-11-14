@@ -21,6 +21,7 @@ pub struct Shared {
     pub mica: AtomicBool,
     pub main_open: AtomicBool,   // 主窗口当前是否存在（v1.1.9：关闭到托盘时窗口会被销毁以释放 WebView2 内存）
     pub cur_silent: AtomicBool,  // 当前接入点的帧时间戳很久没刷新（热点可能刚被关）：链路监视立刻去 ping 网关
+    pub switch_until: AtomicI64, // 程序刚发出连接请求：这个时间（毫秒）之前旧连接掉线是我们自己造成的，链路监视不评估、不判死
     pub scan_asap: AtomicI64,    // 断线类通知到来后，“最早可以立即扫描”的时间（毫秒，0 = 无）
     pub busy_bps: AtomicU64,     // 当前总流量（字节/秒）：大流量时不加速扫描，免得打断视频通话/下载
     pub cur_link: Arc<Mutex<Option<CurLink>>>, // 引擎发布的“当前连接”，链路监视线程与流量采样线程读取
@@ -45,6 +46,7 @@ impl Shared {
             mica: AtomicBool::new(false),
             main_open: AtomicBool::new(false),
             cur_silent: AtomicBool::new(false),
+            switch_until: AtomicI64::new(0),
             scan_asap: AtomicI64::new(0),
             busy_bps: AtomicU64::new(0),
             cur_link: Arc::new(Mutex::new(None)),

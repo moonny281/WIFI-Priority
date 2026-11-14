@@ -247,11 +247,16 @@ impl<H: Host> Engine<H> {
         let s = self.sh.settings.lock().unwrap().clone();
 
         let mut st_opt: Option<WifiState> = None;
+        let (mut ms_scan, mut ms_read) = (0u128, 0u128);
         if self.native_ok {
+            let t_s = Instant::now();
             self.start_scan_if_due(&s);
+            ms_scan = t_s.elapsed().as_millis();
+            let t_r = Instant::now();
             if let Some(c) = self.client.as_mut() {
                 st_opt = c.read_state();
             }
+            ms_read = t_r.elapsed().as_millis();
             if st_opt.is_none() {
                 self.native_ok = false;
                 self.sh.native_mode.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -295,6 +300,7 @@ impl<H: Host> Engine<H> {
             };
         }
 
+        let t_d = Instant::now();
         let dec = self.dec.decide(&st, &s, now_ms(), self.sh.is_paused());
         for l in &dec.logs {
             self.log(l);
@@ -305,6 +311,21 @@ impl<H: Host> Engine<H> {
         let switched = dec.connect.is_some();
         if let Some(plan) = dec.connect {
             self.execute(&plan, t0);
+        }
+        // 本轮耗时异常：说明 WLAN 服务 / 驱动在阻塞（常见于热点刚关、驱动在处理断线的时候）。这段时间引擎无法决策，
+        // 即使链路监视已经判死也要等这一轮结束才能回落——把每一段的耗时写出来，才能知道是哪个调用卡住了。
+        if t0.elapsed().as_millis() > 1500 {
+            let slow = self.client.as_mut().map(|c| c.slow.drain(..).collect::<Vec<_>>()).unwrap_or_default();
+            self.log(&format!(
+                "本轮处理耗时 {} ms（启动扫描 {} / 读取状态 {} / 决策与执行 {}）——WLAN 服务或驱动响应慢，这段时间无法决策{}",
+                t0.elapsed().as_millis(),
+                ms_scan,
+                ms_read,
+                t_d.elapsed().as_millis(),
+                if slow.is_empty() { String::new() } else { format!("；慢调用：{}", slow.join("，")) }
+            ));
+        } else if let Some(c) = self.client.as_mut() {
+            c.slow.clear();
         }
 
         self.publish(&st, switched);
@@ -326,6 +347,8 @@ impl<H: Host> Engine<H> {
     }
 
     fn execute(&mut self, plan: &Plan, t0: Instant) {
+        // 从现在起 3 秒内旧连接掉线是我们自己造成的：链路监视不评估、不判死（否则会把刚离开的好网络写进退避）
+        self.sh.switch_until.store(now_ms() + 3000, std::sync::atomic::Ordering::Relaxed);
         self.log(&format!(
             "切换：{} → {}（{}）",
             plan.from_label.as_deref().unwrap_or("(未连接)"),

@@ -40,6 +40,8 @@ namespace WifiPriority.Services
         public Func<CurLink> GetCurrent;
         /// <summary>引擎观察到当前接入点的帧时间戳很久没刷新（热点可能刚被关）：只用来立刻去 ping 网关，不会单独判死。</summary>
         public Func<bool> GetSilent;
+        /// <summary>程序刚发出连接请求（正在切换网络）：旧连接掉线是我们自己造成的，这段时间不评估、也不判死。</summary>
+        public Func<bool> IsSwitching;
         /// <summary>判死：(ssid, 原因, 用时说明)。里面负责写 Decider 的不可用标记/退避表、置紧急扫描、唤醒引擎。</summary>
         public Action<string, string, string> ReportUnusable;
         /// <summary>从“不可用”恢复为健康。</summary>
@@ -63,7 +65,8 @@ namespace WifiPriority.Services
 
         // ---- 每次连接一份状态 ----
         string _ssid;
-        long _connAt, _lastRx, _outSinceRx, _nextHb, _nextWan, _badSince, _healthySince, _recheckAt;
+        long _connAt, _lastRx, _outSinceRx, _nextHb, _nextWan, _badSince, _healthySince, _recheckAt, _downSince, _nextSeenAt;
+        int _seenTries;
         long _inPrev = -1, _outPrev = -1;
         int _wanFail;
         bool _gwNoIcmp, _gwIcmpSeen, _reported;   // _gwIcmpSeen：这次连接里网关回过 ICMP，之后 ICMP 连续不通就直接判死
@@ -76,7 +79,8 @@ namespace WifiPriority.Services
         {
             _ssid = c.Ssid; _connAt = c.ConnectedAt;
             _lastRx = now;
-            _outSinceRx = _nextHb = _nextWan = _badSince = _healthySince = _recheckAt = 0;
+            _outSinceRx = _nextHb = _nextWan = _badSince = _healthySince = _recheckAt = _downSince = _nextSeenAt = 0;
+            _seenTries = 0;
             _inPrev = _outPrev = -1;
             _wanFail = 0;
             _gwNoIcmp = _gwIcmpSeen = _reported = false;
@@ -95,6 +99,8 @@ namespace WifiPriority.Services
                     var cur = GetCurrent?.Invoke();
                     if (cur == null || !_s.InternetCheck) { _ssid = null; continue; }
                     long now = Now;
+                    // 程序刚发出连接请求（正在切换网络）：旧连接掉线是我们自己造成的，这段时间不评估、也不判死
+                    if (IsSwitching?.Invoke() ?? false) { _ssid = null; continue; }
                     if (_ssid != cur.Ssid || _connAt != cur.ConnectedAt) Reset(cur, now);
 
                     // 已经判死、而且仍然连着（没有别的网络可去）：降低复查频率，别每 250 ms 反复发探测包
@@ -109,11 +115,15 @@ namespace WifiPriority.Services
                     }
                     else if (v == Verdict.LinkDead || v == Verdict.NoInternet)
                     {
-                        if (!_reported)
+                        // 判定期间（探测可能花了一两秒）程序可能已经切走了：确认引擎当前连接仍然是这一个，才报告
+                        var again = GetCurrent?.Invoke();
+                        bool stillCurrent = again != null && again.Ssid == cur.Ssid && again.ConnectedAt == cur.ConnectedAt && !(IsSwitching?.Invoke() ?? false);
+                        if (!_reported && stillCurrent)
                         {
                             _reported = true; _healthySince = 0;
                             string why = v == Verdict.NoInternet ? "已连接，网关可达但公网不通" : _why;
-                            string took = _badSince > 0 ? $"距最后一次收到数据 {now - _badSince} ms 判定" : "即时判定";
+                            // 用判定完成的时刻算（探测本身要花一两秒，不能用这一轮开始的时刻）
+                            string took = _badSince > 0 ? $"距最后一次收到数据 {Now - _badSince} ms 判定" : "即时判定";
                             ReportUnusable?.Invoke(_ssid, why, took);
                         }
                         _recheckAt = now + 2000;
@@ -134,7 +144,16 @@ namespace WifiPriority.Services
                     .FirstOrDefault(n => string.Equals(n.Id, id, StringComparison.OrdinalIgnoreCase));
             }
             if (_ni == null) return Verdict.Pending;
-            if (_ni.OperationalStatus != OperationalStatus.Up) { _why = "网卡/驱动报告链路已断开"; return Verdict.LinkDead; }
+            if (_ni.OperationalStatus != OperationalStatus.Up)
+            {
+                // 链路断开本身不是“网络不可用”：我们自己切换网络、用户手动换网、漫游时旧连接都会短暂掉线。
+                // 真的断了 Windows 会报“已断开”，决策器走断线分支立刻处理。这里只兜底“驱动一直说已连接，但网卡链路持续断开”的异常：
+                // 持续 2 秒以上、而且引擎仍然认为连着同一个网络，才算。
+                if (_downSince == 0) _downSince = Math.Max(now, 1);
+                if (now - _downSince >= 2000) { _why = "网卡/驱动报告链路持续断开"; return Verdict.LinkDead; }
+                return Verdict.Pending;
+            }
+            _downSince = 0;
 
             IPInterfaceStatistics stats;
             try { stats = _ni.GetIPStatistics(); }
@@ -162,7 +181,14 @@ namespace WifiPriority.Services
                 }
                 _nextWan = now;   // 网关一就绪就立刻验一次公网
                 // 顺便 ping 一次网关：回过 ICMP 的网关，之后 ICMP 不通就是真的不通（快速判死）；不回的网关走保守流程
-                if (await PingAsync(_gw, 300)) { _gwIcmpSeen = true; _lastRx = now; }
+                _seenTries = 1; _nextSeenAt = now + 1500;
+                if (await PingAsync(_gw, 500)) { _gwIcmpSeen = true; _lastRx = now; }
+            }
+            // 刚连上时 ARP 还没解析好，第一次 ping 可能超时：之后再试几次（最多 3 次），这样“回过 ICMP 的网关”才能走快速判死
+            if (!_gwIcmpSeen && !_gwNoIcmp && _seenTries < 3 && now >= _nextSeenAt)
+            {
+                _seenTries++; _nextSeenAt = now + 2000;
+                if (await PingAsync(_gw, 500)) { _gwIcmpSeen = true; _lastRx = now; }
             }
 
             int ifIndex;

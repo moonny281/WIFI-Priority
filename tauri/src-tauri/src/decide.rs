@@ -46,8 +46,20 @@ pub type BadMap = Arc<Mutex<HashMap<String, i64>>>;
 pub struct Unusable {
     pub until: i64,
     pub level: u32,
+    pub dead_at: i64, // 判死的时间：退避期过了以后，还要看到它的接入点在这之后又被扫描更新过，才算“真的还在”（缓存里的幽灵条目不算）
 }
 pub type UnusableMap = Arc<Mutex<HashMap<String, Unusable>>>;
+
+/// 这个候选的接入点在 t 时刻之后还没有被扫描更新过（= 可能已经不在了）。与“断开后拉黑”的 blocked() 同一套判据。
+fn unseen_since(c: &Cand, t: i64, now: i64) -> bool {
+    if c.seen_at > 0 {
+        c.seen_at <= t
+    } else if c.seen_at < 0 {
+        now - t < 20_000 // 驱动没给时间戳，无法求证：退化为 20 秒间隔
+    } else {
+        true // 0 = 启动时缓存里的、从未观察到更新：不算证据
+    }
+}
 
 struct Cand {
     ssid: String,
@@ -461,7 +473,9 @@ impl Decider {
             is_bad_key(&bad, &c.key(), now)
                 || no_net.as_deref() == Some(c.ssid.as_str())
                 || skip.as_deref() == Some(c.ssid.as_str())
-                || (!is_current(c) && unusable.get(&c.ssid).map_or(false, |u| u.until > now)) // 判死过的网络：退避期内不当作切换目标（当前连着的由 no_net 负责）
+                // 判死过的网络：退避期内不当作切换目标；退避期过了还要求它在判死之后又被扫描更新过（热点关掉后，
+                // 缓存里的旧条目要好几次扫描才会过期，不能因为退避到期就去连一个已经不在的幽灵）。当前连着的由 no_net 负责。
+                || (!is_current(c) && unusable.get(&c.ssid).map_or(false, |u| u.until > now || unseen_since(c, u.dead_at, now)))
                 || blocked(c)
         };
 

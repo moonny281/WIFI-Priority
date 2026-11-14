@@ -38,6 +38,7 @@ namespace WifiPriority.Services
         volatile CurLink _curLink;
         string _connKey = "";     // ssid|bssid：变了就算“新的一次连接”
         long _connAt;
+        long _switchUntil;           // 程序刚发出连接请求：这个时间（毫秒）之前旧连接掉线是我们自己造成的，链路监视不评估、不判死
         long _scanAsapAt;            // 断线类通知到来后，“最早可以立即扫描”的时间（0 = 无）
         /// <summary>实时流量与用量统计（硬件计数器）。</summary>
         public TrafficService Traffic { get; } = new TrafficService();
@@ -77,6 +78,7 @@ namespace WifiPriority.Services
             {
                 GetCurrent = () => _curLink,
                 GetSilent = () => _fresh.CurSilent,
+                IsSwitching = () => Now < Interlocked.Read(ref _switchUntil),
                 ReportUnusable = (ssid, why, took) =>
                 {
                     long wait = _dec.ReportUnusable(ssid, Now, _s.UnusableBackoffSec);
@@ -196,10 +198,15 @@ namespace WifiPriority.Services
             var t0 = Stopwatch.StartNew();
             WifiState st = null;
 
+            long msScan = 0, msRead = 0;
             if (_native)
             {
+                var tS = Stopwatch.StartNew();
                 StartScanIfDue(Now);
+                msScan = tS.ElapsedMilliseconds;
+                var tR = Stopwatch.StartNew();
                 st = _wlan.ReadState();
+                msRead = tR.ElapsedMilliseconds;
                 if (st == null)
                 {
                     _native = false;
@@ -223,11 +230,17 @@ namespace WifiPriority.Services
             Guid? ifg = st.Connected && st.Fast ? _wlan.IfaceGuid(st.CurIface) : null;
             _curLink = ifg.HasValue ? new CurLink { Ssid = st.Ssid, IfGuid = ifg.Value, ConnectedAt = _connAt } : null;
 
+            var tD = Stopwatch.StartNew();
             var dec = _dec.Decide(st, _s, Now, Paused);
             foreach (var l in dec.Logs) Log?.Invoke(l);
             if (dec.PauseMinutes > 0) _pausedUntil = DateTime.Now.AddMinutes(dec.PauseMinutes);
 
             if (dec.Connect != null) await ExecuteAsync(dec.Connect, t0);
+
+            // 本轮耗时异常：说明 WLAN 服务 / 驱动在阻塞（常见于热点刚关、驱动在处理断线的时候）。这段时间引擎无法决策，
+            // 即使链路监视已经判死也要等这一轮结束才能回落——把每一段的耗时写出来，才能知道是哪个调用卡住了。
+            if (t0.ElapsedMilliseconds > 1500)
+                Log?.Invoke($"本轮处理耗时 {t0.ElapsedMilliseconds} ms（启动扫描 {msScan} / 读取状态 {msRead} / 决策与执行 {tD.ElapsedMilliseconds}）——WLAN 服务或驱动响应慢，这段时间无法决策");
 
             Publish(st, dec.Connect != null);
             // 稳定状态（连着、没在切换、没有在等更高优先级的网络出现）降到 500 ms：事件（通知）依然立刻唤醒
@@ -237,6 +250,8 @@ namespace WifiPriority.Services
 
         async Task ExecuteAsync(Plan plan, Stopwatch t0)
         {
+            // 从现在起 3 秒内旧连接掉线是我们自己造成的：链路监视不评估、不判死（否则会把刚离开的好网络写进退避）
+            Interlocked.Exchange(ref _switchUntil, Now + 3000);
             Log?.Invoke($"切换：{plan.FromLabel ?? "(未连接)"} → {plan.ToLabel}（{plan.Reason}）");
 
             bool ok = false;
