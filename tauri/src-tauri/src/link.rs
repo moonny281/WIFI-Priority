@@ -181,11 +181,57 @@ pub trait Hw {
     fn wan_ok(&self, if_index: u32, timeout: Duration) -> bool;
 }
 
-pub struct RealHw;
+/// 网卡计数器的后台采样：读 GetIfEntry2 可能被驱动 / 系统卡住（热点刚关的几秒里 WLAN 调用能卡 5–9 秒），
+/// 所以放到单独线程里读，监视线程只取“最新一份”；这份太旧（> 1.2 秒）就说明计数器读取卡住了——
+/// 监视线程不会跟着卡，而是进入“盲”模式：直接用网关 ICMP（走 IP 栈，不经过 WLAN 服务）判断链路。
+pub struct Feed {
+    slot: Mutex<Option<(i64, [u8; 16], IfSnapshot)>>,
+    pub slow: Mutex<Vec<String>>,
+}
+
+impl Feed {
+    pub fn new() -> Feed {
+        Feed { slot: Mutex::new(None), slow: Mutex::new(Vec::new()) }
+    }
+
+    fn latest(&self, guid: &[u8; 16], now: i64) -> Option<IfSnapshot> {
+        match self.slot.lock().ok()?.as_ref() {
+            Some((at, g, snap)) if g == guid && now - *at <= 1200 => Some(*snap),
+            _ => None,
+        }
+    }
+}
+
+fn spawn_feed(feed: Arc<Feed>, cur: Arc<Mutex<Option<CurLink>>>) {
+    let _ = std::thread::Builder::new().name("wifi-counters".into()).stack_size(256 * 1024).spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(250));
+        let guid = match cur.lock().ok().and_then(|g| g.clone()) {
+            Some(c) => c.guid,
+            None => continue,
+        };
+        let t = std::time::Instant::now();
+        let snap = read_if(&guid);
+        let ms = t.elapsed().as_millis();
+        if ms > 500 {
+            if let Ok(mut v) = feed.slow.lock() {
+                if v.len() < 8 {
+                    v.push(format!("读取网卡计数器 {} ms", ms));
+                }
+            }
+        }
+        if let (Some(snap), Ok(mut g)) = (snap, feed.slot.lock()) {
+            *g = Some((now_ms(), guid, snap));
+        }
+    });
+}
+
+pub struct RealHw {
+    feed: Arc<Feed>,
+}
 
 impl Hw for RealHw {
     fn read_if(&self, guid: &[u8; 16]) -> Option<IfSnapshot> {
-        read_if(guid)
+        self.feed.latest(guid, now_ms())
     }
     fn gateway(&self, if_index: u32) -> Option<Ipv4Addr> {
         gateway_v4(if_index)
@@ -229,6 +275,7 @@ pub struct LinkState {
     last_rx_at: i64,       // 最后一次收到入站数据的时间（墙钟）——判断“多久没收到东西了”的起点
     out_since_rx: u64,     // 最后一次入站之后发出去的字节数（发了东西却没有回音才算“怀疑”）
     gw: Option<Ipv4Addr>,
+    pub suspect: bool,      // 本轮的“怀疑”状态（给引擎用：怀疑期间暂停扫描）
     pub gw_icmp_seen: bool, // 这次连接里网关回过 ICMP：之后 ICMP 连续不通就直接判死，不再串行等公网复核
     pub gw_no_icmp: bool,   // 该网关不回 ICMP（但公网通）：之后不再用 ICMP 做心跳，避免误判
     next_hb_at: i64,
@@ -255,11 +302,16 @@ impl LinkState {
 /// silent：引擎观察到当前接入点的帧时间戳很久没刷新（热点可能刚被关）——只用来立刻去 ping 网关，不会单独判死。
 pub fn evaluate<H: Hw>(hw: &H, st: &mut LinkState, guid: &[u8; 16], s: &Settings, now: i64, silent: bool) -> Verdict {
     // —— L1：硬件说链路断了，直接判死，不发任何包 ——
-    let snap = match hw.read_if(guid) {
-        Some(x) => x,
-        None => return Verdict::Pending,
+    // 计数器读不到（读取线程被驱动 / 系统卡住了）：用上一份快照继续，进入“盲”模式——
+    // 看不到收发字节，就只看“距最后一次收到数据多久”（上一次确认还活着的时刻），直接去 ping 网关
+    let (snap, blind) = match hw.read_if(guid) {
+        Some(x) => (x, false),
+        None => match st.prev {
+            Some(p) => (p, true),
+            None => return Verdict::Pending,
+        },
     };
-    if !snap.oper_up || !snap.media_up {
+    if !blind && (!snap.oper_up || !snap.media_up) {
         // 链路断开本身不是“网络不可用”：我们自己切换网络时，旧连接必然短暂掉线；用户手动换网、漫游也是。
         // 真的断了 Windows 会报“已断开”，决策器走断线分支立刻处理。这里只兜底“驱动一直说已连接，但网卡链路持续断开”的异常：
         // 持续 2 秒以上、而且引擎仍然认为连着同一个网络，才算。
@@ -270,6 +322,7 @@ pub fn evaluate<H: Hw>(hw: &H, st: &mut LinkState, guid: &[u8; 16], s: &Settings
     }
     st.down_since = 0;
     match &st.prev {
+        _ if blind => {} // 盲：不更新收发计数
         Some(p) => {
             let d_in = snap.in_octets.saturating_sub(p.in_octets);
             let d_out = snap.out_octets.saturating_sub(p.out_octets);
@@ -283,7 +336,9 @@ pub fn evaluate<H: Hw>(hw: &H, st: &mut LinkState, guid: &[u8; 16], s: &Settings
         }
         None => st.last_rx_at = now,
     }
-    st.prev = Some(snap);
+    if !blind {
+        st.prev = Some(snap);
+    }
 
     // —— 刚连上：等 DHCP/网关就绪（事件唤醒 + 上限），取代旧版固定的 12 秒 ——
     if st.gw.is_none() {
@@ -318,7 +373,8 @@ pub fn evaluate<H: Hw>(hw: &H, st: &mut LinkState, guid: &[u8; 16], s: &Settings
     // 起点是“最后一次收到数据”（墙钟），不是“发现异常的那一拍”：真实断线到判死的时间才算得准
     let since_rx = now - st.last_rx_at;
     // 发了东西（>= 256 字节）却已经 stall_ms 没有任何回音 → 怀疑；完全空闲时由心跳兜底
-    let suspect = since_rx >= s.stall_ms && st.out_since_rx >= 256;
+    let suspect = since_rx >= s.stall_ms && (blind || st.out_since_rx >= 256);
+    st.suspect = suspect;
     let wan_timeout = Duration::from_millis(s.wan_timeout_ms.max(1) as u64);
     let probe_due = suspect || (now >= st.next_hb_at && (since_rx >= s.heartbeat_ms || silent));
     let mut gw_alive = false;
@@ -392,10 +448,13 @@ pub fn spawn_monitor(
     no_net: Arc<Mutex<Option<String>>>,
     unusable: UnusableMap,
     rx: mpsc::Receiver<u32>,
-    log: impl Fn(&str) + Send + 'static,
+    log: impl Fn(&str) + Send + Sync + 'static,
 ) {
+    let log: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(log);
+    let feed = Arc::new(Feed::new());
+    spawn_feed(feed.clone(), cur.clone());
     let _ = std::thread::Builder::new().name("wifi-link".into()).spawn(move || {
-        let hw = RealHw;
+        let hw = RealHw { feed: feed.clone() };
         let mut st = LinkState::default();
         loop {
             match rx.recv_timeout(Duration::from_millis(250)) {
@@ -405,10 +464,16 @@ pub fn spawn_monitor(
             while rx.try_recv().is_ok() {}
 
             let s = sh.settings.lock().unwrap().clone();
+            // 计数器读取线程里出现的慢调用：写进日志（热点刚关时系统 / 驱动忙，才能看出是谁在卡）
+            let slow: Vec<String> = feed.slow.lock().map(|mut v| v.drain(..).collect()).unwrap_or_default();
+            if !slow.is_empty() {
+                log(&format!("链路监视：{}——驱动 / 系统响应慢，监视线程改用网关 ICMP 判断", slow.join("，")));
+            }
             let c = match cur.lock().unwrap().clone() {
                 Some(c) if s.internet_check => c,
                 _ => {
                     st = LinkState::default();
+                    sh.link_suspect.store(false, Ordering::Relaxed);
                     continue;
                 }
             };
@@ -427,7 +492,12 @@ pub fn spawn_monitor(
             }
 
             let silent = sh.cur_silent.load(Ordering::Relaxed);
+            let t_eval = std::time::Instant::now();
             let verdict = evaluate(&hw, &mut st, &c.guid, &s, now, silent);
+            sh.link_suspect.store(st.suspect && !st.reported, Ordering::Relaxed);
+            if t_eval.elapsed().as_millis() > 2500 {
+                log(&format!("链路监视本轮判定耗时 {} ms（探测被系统 / 驱动拖慢）", t_eval.elapsed().as_millis()));
+            }
             let dead_reason: Option<&'static str> = match verdict {
                 Verdict::LinkDead(why) => Some(why),
                 Verdict::NoInternet => Some("已连接，网关可达但公网不通"),
@@ -483,6 +553,8 @@ pub fn spawn_monitor(
                     };
                     log(&format!("{} 不可用：{}（{}），回落到下一个网络；{}", c.ssid, why, took, again));
                     sh.wake();
+                    // 引擎被 WLAN 调用卡住时，由救援线程直接发起回落连接（引擎没卡就什么都不做）
+                    crate::rescue::spawn(sh.clone(), c.ssid.clone(), now_ms(), unusable.clone(), log.clone());
                 }
                 st.recheck_at = now + 2000;
             }

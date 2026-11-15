@@ -38,6 +38,13 @@ namespace WifiPriority.Services
         volatile CurLink _curLink;
         string _connKey = "";     // ssid|bssid：变了就算“新的一次连接”
         long _connAt;
+        // v1.2.2 救援：这几个时间戳用 Environment.TickCount64（与 WlanClient.LastConnCompleteTick 同一个时钟）
+        long _tickBusySince;         // 引擎当前这一轮开始的时间（0 = 空闲）：一轮超过 600 ms 说明被系统调用卡住了
+        long _lastConnectAt;         // 引擎最近一次发出连接请求的时间
+        long _rescuedAt;             // 救援任务最近一次发起回落连接的时间（0 = 没有）
+        volatile bool _linkSuspect;  // 链路监视怀疑当前连接已经没有回音：暂停扫描，别给正在出问题的驱动添乱
+        class FallbackBox { public Plan Plan; public Guid? Guid; public long MadeTick; }
+        volatile FallbackBox _fallbackBox;
         long _switchUntil;           // 程序刚发出连接请求：这个时间（毫秒）之前旧连接掉线是我们自己造成的，链路监视不评估、不判死
         long _scanAsapAt;            // 断线类通知到来后，“最早可以立即扫描”的时间（0 = 无）
         /// <summary>实时流量与用量统计（硬件计数器）。</summary>
@@ -79,6 +86,9 @@ namespace WifiPriority.Services
                 GetCurrent = () => _curLink,
                 GetSilent = () => _fresh.CurSilent,
                 IsSwitching = () => Now < Interlocked.Read(ref _switchUntil),
+                SetSuspect = v => _linkSuspect = v,
+                OnDeclaredDead = (ssid, verdictTick) => { var _ = RescueAsync(ssid, verdictTick); },
+                LogSlow = m => Log?.Invoke(m),
                 ReportUnusable = (ssid, why, took) =>
                 {
                     long wait = _dec.ReportUnusable(ssid, Now, _s.UnusableBackoffSec);
@@ -117,9 +127,60 @@ namespace WifiPriority.Services
             // 断线类通知（ACM disconnecting/disconnected、MSM disassociating/disconnected）：300 ms 后立刻扫描一次，
             // 马上知道刚才的网络还在不在、下一个网络是否可用。延后 300 ms 是为了不打断用户手动换网的关联过程。
             if (code == 20 || code == 21 || code == (WlanClient.MsmFlag | 9) || code == (WlanClient.MsmFlag | 10)) _scanAsapAt = Now + 300;
+            // 断线通知打一行日志：通知到来的时刻和“判死”的时刻对比，就能知道手机关热点时有没有发断开帧
+            // （通知比判死早 = 有断开帧；通知比判死晚好几秒 = 没有，Windows 靠信标丢失才发现）
+            string noteName = code == 20 ? "ACM 正在断开" : code == 21 ? "ACM 已断开"
+                : code == (WlanClient.MsmFlag | 9) ? "MSM 解除关联" : code == (WlanClient.MsmFlag | 10) ? "MSM 已断开" : null;
+            if (noteName != null) Log?.Invoke("WLAN 通知：" + noteName);
             if (code == WlanClient.AcmConnectionAttemptFail) _dec.NoteAttemptFailed(Now);   // 驱动已经明确告知“连接请求失败”：不再傻等 SettleMs
             _link?.Wake();                                                                    // ACM / MSM 事件都叫醒链路监视
             TriggerNow();
+        }
+
+        /// <summary>
+        /// 救援（v1.2.2）。热点被突然关掉时，Windows 的 WLAN 服务 / 驱动会无响应 5–9 秒（日志里 WlanQueryInterface(当前连接) 9135 ms），
+        /// 引擎被卡在这些调用里，即使链路监视已经判死了当前网络，也要等这一轮结束才能回落。
+        /// 链路监视判死后最多观察 4 秒：引擎自己发出了连接请求 → 什么都不做；引擎这一轮卡住 >= 600 ms →
+        /// 用独立的 WLAN 句柄对预先算好的回落方案直接发起连接。如果卡住的是 WLAN 服务内部的锁，独立句柄的请求也会被卡，
+        /// 救援就帮不上——日志会写出耗时，据此判断。防护：10 秒内最多一次；暂停状态不救援；方案 15 秒没刷新就作废；
+        /// 回落目标在退避期里不救援；判死之后已有连接完成（Windows 自己回落 / 用户手动换网）也不救援；设置 RescueConnect 可关闭。
+        /// </summary>
+        async Task RescueAsync(string deadSsid, long verdictTick)
+        {
+            try
+            {
+                if (!_s.RescueConnect) return;
+                long lastRescue = Interlocked.Read(ref _rescuedAt);
+                if (lastRescue != 0 && verdictTick - lastRescue < 10000) return;
+                long deadline = verdictTick + 4000, stalled;
+                while (true)
+                {
+                    if (Interlocked.Read(ref _lastConnectAt) >= verdictTick) return;                      // 引擎自己已经发起了回落连接
+                    if (Interlocked.Read(ref WlanClient.LastConnCompleteTick) >= verdictTick) return;    // 判死之后已经有连接完成了
+                    long nowT = Environment.TickCount64, busy = Interlocked.Read(ref _tickBusySince);
+                    if (busy != 0 && nowT - busy >= 600) { stalled = nowT - busy; break; }                // 引擎这一轮卡住了
+                    if (nowT >= deadline) return;                                                         // 引擎没卡：它自己会处理
+                    await Task.Delay(50);
+                }
+                if (Paused) return;
+                var fb = _fallbackBox;
+                long now2 = Environment.TickCount64;
+                if (fb == null) { Log?.Invoke("救援：引擎被系统调用卡住，但没有预先算好的回落方案，无法救援"); return; }
+                if (now2 - fb.MadeTick > 15000 || fb.Plan.Ssid == deadSsid) { Log?.Invoke("救援：预先算好的回落方案已过期，不救援"); return; }
+                if (_dec.IsInBackoff(fb.Plan.Ssid, Now)) return;       // 回落目标自己刚判死过，还在退避期
+                if (fb.Guid == null) return;
+
+                Interlocked.Exchange(ref _rescuedAt, now2);
+                Interlocked.Exchange(ref _switchUntil, Now + 3000);    // 和正常切换一样：3 秒内链路监视不评估
+                var sw = Stopwatch.StartNew();
+                bool ok = await Task.Run(() =>
+                {
+                    using (var c = new WlanClient())
+                        return c.OpenQuiet() && c.ConnectGuid(fb.Plan.Profile, null, fb.Guid.Value);
+                });
+                Log?.Invoke($"救援：引擎已被系统调用卡住 {stalled} ms，救援任务直接发起回落连接 {deadSsid} → {fb.Plan.ToLabel}（{(ok ? "请求已被系统接受" : "系统没有接受请求")}，WlanConnect 用时 {sw.ElapsedMilliseconds} ms）");
+            }
+            catch { }
         }
 
         /// <summary>立即触发一轮评估（唤醒、网络变化、用户点击“立即扫描”等）。</summary>
@@ -150,6 +211,8 @@ namespace WifiPriority.Services
 
         void StartScanIfDue(long now)
         {
+            // 链路监视怀疑当前连接已经没有回音（热点可能刚被关，驱动正在处理断线）：暂停扫描，别给正在出问题的驱动添乱
+            if (_linkSuspect) return;
             long normalGap = _s.ScanIntervalSec <= 0 ? 400 : _s.ScanIntervalSec * 1000L;
             // 猎取模式（有更高优先级的已保存网络现在看不到，或者当前不可用 / 未连接）：用更短的间隔扫描，热点一打开就能看到并连上。
             // 正在大流量（视频通话 / 下载）时不加速，免得扫描打断它。
@@ -195,6 +258,14 @@ namespace WifiPriority.Services
         /// <summary>一轮：读状态 → 决策 → 执行。返回下一轮前的等待毫秒数。</summary>
         async Task<int> TickAsync()
         {
+            // 外面包一层，记录“这一轮什么时候开始 / 结束”——救援任务据此判断引擎是不是被系统调用卡住了
+            Interlocked.Exchange(ref _tickBusySince, Math.Max(Environment.TickCount64, 1));
+            try { return await TickInnerAsync(); }
+            finally { Interlocked.Exchange(ref _tickBusySince, 0); }
+        }
+
+        async Task<int> TickInnerAsync()
+        {
             var t0 = Stopwatch.StartNew();
             WifiState st = null;
 
@@ -232,6 +303,14 @@ namespace WifiPriority.Services
 
             var tD = Stopwatch.StartNew();
             var dec = _dec.Decide(st, _s, Now, Paused);
+            // 把预先算好的回落方案放进共享状态：引擎被系统调用卡住时，救援任务直接用它
+            var fb = _dec.FallbackPlan;
+            _fallbackBox = fb == null ? null : new FallbackBox
+            {
+                Plan = fb.Value.Plan,
+                Guid = _wlan.IfaceGuid(fb.Value.Plan.Iface),
+                MadeTick = Environment.TickCount64 - (Now - fb.Value.At),
+            };
             foreach (var l in dec.Logs) Log?.Invoke(l);
             if (dec.PauseMinutes > 0) _pausedUntil = DateTime.Now.AddMinutes(dec.PauseMinutes);
 
@@ -252,6 +331,7 @@ namespace WifiPriority.Services
         {
             // 从现在起 3 秒内旧连接掉线是我们自己造成的：链路监视不评估、不判死（否则会把刚离开的好网络写进退避）
             Interlocked.Exchange(ref _switchUntil, Now + 3000);
+            Interlocked.Exchange(ref _lastConnectAt, Environment.TickCount64);
             Log?.Invoke($"切换：{plan.FromLabel ?? "(未连接)"} → {plan.ToLabel}（{plan.Reason}）");
 
             bool ok = false;

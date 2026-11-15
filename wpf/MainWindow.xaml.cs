@@ -465,6 +465,7 @@ namespace WifiPriority
             TbManualPause.Text = S.ManualPauseMinutes.ToString();
             SwTakeover.IsChecked = S.TakeoverUnlisted;
             SwInternet.IsChecked = S.InternetCheck;
+            SwRescue.IsChecked = S.RescueConnect;
             TbHuntScan.Text = S.HuntScanMs.ToString();
             TbStallMs.Text = S.StallMs.ToString();
             TbWanInterval.Text = S.WanIntervalSec.ToString();
@@ -508,6 +509,7 @@ namespace WifiPriority
             S.ManualPauseMinutes = ParseInt(TbManualPause, S.ManualPauseMinutes, 0, 1440);
             S.TakeoverUnlisted = SwTakeover.IsChecked == true;
             S.InternetCheck = SwInternet.IsChecked == true;
+            S.RescueConnect = SwRescue.IsChecked == true;
             S.HuntScanMs = ParseInt(TbHuntScan, S.HuntScanMs, 0, 10000);
             if (S.HuntScanMs != 0 && S.HuntScanMs < 300) S.HuntScanMs = 300;
             S.StallMs = ParseInt(TbStallMs, S.StallMs, 500, 10000);

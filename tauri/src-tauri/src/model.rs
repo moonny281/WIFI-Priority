@@ -40,6 +40,7 @@ pub struct Settings {
     // v1.1.9
     pub hunt_scan_ms: i64,         // 有更高优先级网络“还没出现”时的扫描间隔（毫秒；热点一开就能连上）；0 = 不加速，沿用 ScanIntervalSec
     pub overlay_show_traffic: bool, // 悬浮框显示实时流量与用量
+    pub rescue_connect: bool,       // v1.2.2：引擎被 WLAN 调用卡住时，判死后由救援线程用独立句柄直接发起回落连接
     pub overlay_native: bool,       // v1.2.0：悬浮框用原生窗口（GDI）绘制，不创建 WebView2——后台内存占用低一个数量级；关掉则用网页版悬浮框
     pub notify: bool,
 
@@ -86,6 +87,7 @@ impl Default for Settings {
             disc_grace_ms: 400,
             hunt_scan_ms: 1500,
             overlay_show_traffic: true,
+            rescue_connect: true,
             overlay_native: true,
             notify: true,
             band_policy: "Same".into(),

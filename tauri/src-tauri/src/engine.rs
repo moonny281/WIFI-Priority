@@ -193,6 +193,18 @@ impl<H: Host> Engine<H> {
         if code == 20 || code == 21 || code == native::MSM_DISASSOCIATING || code == native::MSM_DISCONNECTED {
             self.sh.scan_asap.store(now_ms() + 300, std::sync::atomic::Ordering::Relaxed);
         }
+        // 断线通知打一行日志：通知到来的时刻和“判死”的时刻对比，就能知道手机关热点时有没有发断开帧
+        // （通知比判死早 = 有断开帧；通知比判死晚好几秒 = 没有，Windows 靠信标丢失才发现）
+        let note_name = match code {
+            20 => Some("ACM 正在断开"),
+            21 => Some("ACM 已断开"),
+            c if c == native::MSM_DISASSOCIATING => Some("MSM 解除关联"),
+            c if c == native::MSM_DISCONNECTED => Some("MSM 已断开"),
+            _ => None,
+        };
+        if let Some(n) = note_name {
+            self.log(&format!("WLAN 通知：{}", n));
+        }
         if code == native::ACM_CONNECTION_ATTEMPT_FAIL {
             // 驱动已经明确告知“连接请求失败”：不再傻等 SETTLE_MS
             self.dec.note_attempt_failed(now_ms());
@@ -201,6 +213,10 @@ impl<H: Host> Engine<H> {
     }
 
     fn start_scan_if_due(&mut self, s: &Settings) {
+        // 链路监视怀疑当前连接已经没有回音（热点可能刚被关，驱动正在处理断线）：暂停扫描，别给正在出问题的驱动添乱
+        if self.sh.link_suspect.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let now = now_ms();
         let normal_gap = if s.scan_interval_sec <= 0 { 400 } else { s.scan_interval_sec * 1000 };
         // 猎取模式（有更高优先级的已保存网络现在看不到，或者当前不可用 / 未连接）：用更短的间隔扫描，热点一打开就能看到并连上。
@@ -242,7 +258,17 @@ impl<H: Host> Engine<H> {
     }
 
     /// 一轮：读状态 → 决策 → 执行。返回下一轮前的等待毫秒数。
+    /// 一轮：外面包一层，记录“这一轮什么时候开始 / 结束”——救援线程据此判断引擎是不是被系统调用卡住了。
     fn tick(&mut self) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.sh.tick_busy_since.store(now_ms().max(1), Relaxed);
+        let w = self.tick_inner();
+        self.sh.tick_done_at.store(now_ms(), Relaxed);
+        self.sh.tick_busy_since.store(0, Relaxed);
+        w
+    }
+
+    fn tick_inner(&mut self) -> u64 {
         let t0 = Instant::now();
         let s = self.sh.settings.lock().unwrap().clone();
 
@@ -302,6 +328,13 @@ impl<H: Host> Engine<H> {
 
         let t_d = Instant::now();
         let dec = self.dec.decide(&st, &s, now_ms(), self.sh.is_paused());
+        // 把预先算好的回落方案放进共享状态：引擎被系统调用卡住时，救援线程直接用它
+        if let Ok(mut g) = self.sh.fallback.lock() {
+            *g = self.dec.fallback_plan().map(|(plan, at)| {
+                let guid = self.client.as_ref().and_then(|c| c.iface_guid(plan.iface));
+                crate::state::Fallback { plan, guid, made_at: at }
+            });
+        }
         for l in &dec.logs {
             self.log(l);
         }
@@ -349,6 +382,7 @@ impl<H: Host> Engine<H> {
     fn execute(&mut self, plan: &Plan, t0: Instant) {
         // 从现在起 3 秒内旧连接掉线是我们自己造成的：链路监视不评估、不判死（否则会把刚离开的好网络写进退避）
         self.sh.switch_until.store(now_ms() + 3000, std::sync::atomic::Ordering::Relaxed);
+        self.sh.last_connect_at.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
         self.log(&format!(
             "切换：{} → {}（{}）",
             plan.from_label.as_deref().unwrap_or("(未连接)"),
@@ -359,7 +393,11 @@ impl<H: Host> Engine<H> {
         let mut ok = false;
         if self.native_ok {
             if let Some(c) = &self.client {
+                let t_c = Instant::now();
                 ok = c.connect(&plan.profile, plan.bssid.as_deref(), plan.iface);
+                if t_c.elapsed().as_millis() > 500 {
+                    self.log(&format!("WlanConnect 调用耗时 {} ms（WLAN 服务忙）", t_c.elapsed().as_millis()));
+                }
             }
         }
         if !ok {

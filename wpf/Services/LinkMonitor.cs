@@ -42,6 +42,12 @@ namespace WifiPriority.Services
         public Func<bool> GetSilent;
         /// <summary>程序刚发出连接请求（正在切换网络）：旧连接掉线是我们自己造成的，这段时间不评估、也不判死。</summary>
         public Func<bool> IsSwitching;
+        /// <summary>怀疑当前连接已经没有回音：引擎暂停扫描。</summary>
+        public Action<bool> SetSuspect;
+        /// <summary>判死后通知引擎侧的救援任务：(ssid, 判死时刻 Environment.TickCount64)。</summary>
+        public Action<string, long> OnDeclaredDead;
+        /// <summary>慢调用日志。</summary>
+        public Action<string> LogSlow;
         /// <summary>判死：(ssid, 原因, 用时说明)。里面负责写 Decider 的不可用标记/退避表、置紧急扫描、唤醒引擎。</summary>
         public Action<string, string, string> ReportUnusable;
         /// <summary>从“不可用”恢复为健康。</summary>
@@ -74,6 +80,21 @@ namespace WifiPriority.Services
         NetworkInterface _ni;
         long _niAt = -100000;
         string _why;
+        bool _blindLogged, _suspectNow;
+        Task _pending;   // 上一次没完成的限时读取：它还没返回就不再发起新的（避免线程池被一个卡住的系统调用堆满）
+
+        /// <summary>在后台任务里执行 f，限时 ms 毫秒；超时返回 (false, default)，后台任务继续跑（下次先看它完成没有）。</summary>
+        async Task<(bool Ok, T Value)> TimedAsync<T>(Func<T> f, int ms)
+        {
+            if (_pending != null && !_pending.IsCompleted) return (false, default(T));
+            var t = Task.Run(f);
+            _pending = t;
+            var done = await Task.WhenAny(t, Task.Delay(ms));
+            if (done != t) return (false, default(T));
+            _pending = null;
+            try { return (true, t.Result); }
+            catch { return (false, default(T)); }
+        }
 
         void Reset(CurLink c, long now)
         {
@@ -97,7 +118,7 @@ namespace WifiPriority.Services
                 try
                 {
                     var cur = GetCurrent?.Invoke();
-                    if (cur == null || !_s.InternetCheck) { _ssid = null; continue; }
+                    if (cur == null || !_s.InternetCheck) { _ssid = null; SetSuspect?.Invoke(false); continue; }
                     long now = Now;
                     // 程序刚发出连接请求（正在切换网络）：旧连接掉线是我们自己造成的，这段时间不评估、也不判死
                     if (IsSwitching?.Invoke() ?? false) { _ssid = null; continue; }
@@ -107,6 +128,7 @@ namespace WifiPriority.Services
                     if (_reported && now < _recheckAt) continue;
 
                     var v = await EvaluateAsync(cur.IfGuid, now);
+                    SetSuspect?.Invoke(_suspectNow && !_reported);
                     if (v == Verdict.Healthy)
                     {
                         if (_healthySince == 0) _healthySince = now;
@@ -125,6 +147,8 @@ namespace WifiPriority.Services
                             // 用判定完成的时刻算（探测本身要花一两秒，不能用这一轮开始的时刻）
                             string took = _badSince > 0 ? $"距最后一次收到数据 {Now - _badSince} ms 判定" : "即时判定";
                             ReportUnusable?.Invoke(_ssid, why, took);
+                            // 引擎被 WLAN 调用卡住时，由救援任务直接发起回落连接（引擎没卡就什么都不做）
+                            OnDeclaredDead?.Invoke(_ssid, Environment.TickCount64);
                         }
                         _recheckAt = now + 2000;
                     }
@@ -135,38 +159,53 @@ namespace WifiPriority.Services
 
         async Task<Verdict> EvaluateAsync(Guid guid, long now)
         {
+            _suspectNow = false;
             // —— L1：网卡硬件状态与驱动计数器 ——
+            // 这两个读取（枚举网卡 / 读统计）在热点刚关的几秒里可能被驱动、系统卡住：放到后台任务里并限时，
+            // 监视线程不会跟着卡；读不到就进入“盲”模式——看不到收发字节，只看“距最后一次收到数据多久”，直接去 ping 网关
+            bool blind = false;
             if (_ni == null || now - _niAt >= 500)
             {
-                _niAt = now;
                 string id = guid.ToString("B");
-                _ni = NetworkInterface.GetAllNetworkInterfaces()
-                    .FirstOrDefault(n => string.Equals(n.Id, id, StringComparison.OrdinalIgnoreCase));
+                var (okNi, ni) = await TimedAsync(() => NetworkInterface.GetAllNetworkInterfaces()
+                    .FirstOrDefault(n => string.Equals(n.Id, id, StringComparison.OrdinalIgnoreCase)), 400);
+                if (okNi) { _ni = ni; _niAt = now; } else blind = true;
             }
-            if (_ni == null) return Verdict.Pending;
-            if (_ni.OperationalStatus != OperationalStatus.Up)
+            if (_ni == null && !blind) return Verdict.Pending;
+            long inB = 0, outB = 0;
+            if (!blind)
             {
-                // 链路断开本身不是“网络不可用”：我们自己切换网络、用户手动换网、漫游时旧连接都会短暂掉线。
-                // 真的断了 Windows 会报“已断开”，决策器走断线分支立刻处理。这里只兜底“驱动一直说已连接，但网卡链路持续断开”的异常：
-                // 持续 2 秒以上、而且引擎仍然认为连着同一个网络，才算。
-                if (_downSince == 0) _downSince = Math.Max(now, 1);
-                if (now - _downSince >= 2000) { _why = "网卡/驱动报告链路持续断开"; return Verdict.LinkDead; }
-                return Verdict.Pending;
-            }
-            _downSince = 0;
+                if (_ni.OperationalStatus != OperationalStatus.Up)
+                {
+                    // 链路断开本身不是“网络不可用”：我们自己切换网络、用户手动换网、漫游时旧连接都会短暂掉线。
+                    // 真的断了 Windows 会报“已断开”，决策器走断线分支立刻处理。这里只兜底“驱动一直说已连接，但网卡链路持续断开”的异常：
+                    // 持续 2 秒以上、而且引擎仍然认为连着同一个网络，才算。
+                    if (_downSince == 0) _downSince = Math.Max(now, 1);
+                    if (now - _downSince >= 2000) { _why = "网卡/驱动报告链路持续断开"; return Verdict.LinkDead; }
+                    return Verdict.Pending;
+                }
+                _downSince = 0;
 
-            IPInterfaceStatistics stats;
-            try { stats = _ni.GetIPStatistics(); }
-            catch { return Verdict.Pending; }
-            long inB = stats.BytesReceived, outB = stats.BytesSent;
-            if (_inPrev >= 0)
-            {
-                long dIn = inB - _inPrev, dOut = outB - _outPrev;
-                if (dIn > 0) { _lastRx = now; _outSinceRx = 0; _badSince = 0; }
-                else if (dOut > 0) _outSinceRx += dOut;
+                var (okSt, stats) = await TimedAsync(() => _ni.GetIPStatistics(), 400);
+                if (okSt) { inB = stats.BytesReceived; outB = stats.BytesSent; } else blind = true;
             }
-            else _lastRx = now;
-            _inPrev = inB; _outPrev = outB;
+            if (blind)
+            {
+                if (_ni == null) return Verdict.Pending;
+                if (!_blindLogged) { _blindLogged = true; LogSlow?.Invoke("链路监视：读取网卡计数器被驱动 / 系统卡住——驱动 / 系统响应慢，监视线程改用网关 ICMP 判断"); }
+            }
+            else
+            {
+                _blindLogged = false;
+                if (_inPrev >= 0)
+                {
+                    long dIn = inB - _inPrev, dOut = outB - _outPrev;
+                    if (dIn > 0) { _lastRx = now; _outSinceRx = 0; _badSince = 0; }
+                    else if (dOut > 0) _outSinceRx += dOut;
+                }
+                else _lastRx = now;
+                _inPrev = inB; _outPrev = outB;
+            }
 
             // —— 刚连上：等 DHCP/网关就绪（事件唤醒 + 上限），取代旧版固定的 12 秒 ——
             if (_gw == null)
@@ -198,7 +237,8 @@ namespace WifiPriority.Services
             // 起点是“最后一次收到数据”（墙钟），不是“发现异常的那一拍”：真实断线到判死的时间才算得准
             long sinceRx = now - _lastRx;
             // 发了东西（>= 256 字节）却已经 StallMs 没有任何回音 → 怀疑；完全空闲时由心跳兜底
-            bool suspect = sinceRx >= _s.StallMs && _outSinceRx >= 256;
+            bool suspect = sinceRx >= _s.StallMs && (blind || _outSinceRx >= 256);
+            _suspectNow = suspect;
             bool silent = GetSilent?.Invoke() ?? false;
             bool probeDue = suspect || (now >= _nextHb && (sinceRx >= _s.HeartbeatMs || silent));
             bool gwAlive = false;

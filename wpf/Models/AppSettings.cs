@@ -29,6 +29,7 @@ namespace WifiPriority.Models
         public int DiscGraceMs { get; set; } = 400;        // 断开后的让路窗口（信号弱 / 扫描证明原网络已消失时自动为 0）
         // v1.1.9
         public int HuntScanMs { get; set; } = 1500;        // 有更高优先级网络“还没出现”时的扫描间隔（毫秒；热点一开就能连上）；0 = 不加速，沿用 ScanIntervalSec
+        public bool RescueConnect { get; set; } = true;    // v1.2.2：引擎被 WLAN 调用卡住时，判死后由救援任务用独立句柄直接发起回落连接
         public bool OverlayShowTraffic { get; set; } = true;   // 悬浮框显示实时流量与用量
         public bool Notify { get; set; } = true;           // 切换时弹出托盘通知
 

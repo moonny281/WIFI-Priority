@@ -14,6 +14,7 @@ mod netsh;
 mod ops;
 mod overlay;
 mod parse;
+mod rescue;
 mod state;
 mod traffic;
 mod tray;

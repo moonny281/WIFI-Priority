@@ -74,7 +74,8 @@ namespace WifiPriority.Services
         readonly Dictionary<string, long> _appeared = new Dictionary<string, long>();   // 从“不可见”变为“可见”的时间：刚出现的更高优先级网络免冷却、免确认
         bool _hunting;                                   // 有更高优先级的已保存网络当前不可见（或当前不可用 / 未连接）：引擎用更短间隔扫描
         string _leftSsid;                                // 最近一次非程序发起断开前所在的网络
-        long _scanDoneAt;                                // 最近一次扫描完成的时间
+        long _scanDoneAt;
+        Plan _fallback; long _fallbackAt;                // 预先算好的回落方案（“当前网络死了该去哪”）及其计算时间
         long _attemptFailAt;        // 最近一次收到驱动“连接请求失败”通知的时间（0 = 没有）
 
         /// <summary>联网检测报告：当前连着的这个网络无法上网 → 本轮决策把它当作不可用，回退到下一个。</summary>
@@ -119,6 +120,15 @@ namespace WifiPriority.Services
 
         /// <summary>引擎收到“扫描完成”通知：断线后用它判断原网络是不是真的没了（热点被关）。</summary>
         public void NoteScanDone(long now) { _scanDoneAt = now; }
+
+        /// <summary>该网络当前是否还在退避期里（救援任务用）。</summary>
+        public bool IsInBackoff(string ssid, long now)
+        {
+            lock (_unusable) return _unusable.TryGetValue(ssid, out var u) && u.Until > now;
+        }
+
+        /// <summary>预先算好的回落方案：引擎每轮取走；引擎被系统调用卡住时由救援任务直接使用。</summary>
+        public (Plan Plan, long At)? FallbackPlan => _fallback == null ? ((Plan, long)?)null : (_fallback, _fallbackAt);
 
         /// <summary>引擎据此决定扫描间隔：true = 用更短的间隔扫描（热点一出现就能连上）。</summary>
         public bool Hunting => _hunting;
@@ -385,6 +395,26 @@ namespace WifiPriority.Services
 
             var ordered = Order(cands, policy, prefer24).ToList();
             var best = ordered.FirstOrDefault(Usable);
+
+            // 预先算好“如果当前网络死了，下一个去哪”：优先级最高、没被拉黑、有已保存配置、信号 >= 回落阈值的另一个网络。
+            // 不指定 BSSID（缓存里的接入点地址可能是旧的）。引擎被 WLAN 调用卡住时，救援任务直接用它。
+            _fallback = null;
+            if (cur != null)
+            {
+                var fbc = ordered.FirstOrDefault(fc => fc.Ssid != cur && !IsBad(fc) && !string.IsNullOrEmpty(fc.Profile)
+                    && (st.Profiles.Contains(fc.Profile) || st.Profiles.Contains(fc.Ssid))
+                    && fc.Signal >= Math.Max(s.DownThreshold, s.MinConnectSignal));
+                if (fbc != null)
+                {
+                    _fallback = new Plan
+                    {
+                        Ssid = fbc.Ssid, Band = 0, Bssid = null, Iface = fbc.Iface, Profile = fbc.Profile,
+                        Reason = "引擎被系统调用卡住，由救援任务直接回落",
+                        FromLabel = Label(cur, st.CurBand), ToLabel = Label(fbc.Ssid, fbc.Band),
+                    };
+                    _fallbackAt = now;
+                }
+            }
 
             // 诊断：排在当前网络前面的候选被挡住时，说明原因（30 秒最多一条），免得用户看不出“为什么没切”
             bool held = best == null || IsCurrent(best);

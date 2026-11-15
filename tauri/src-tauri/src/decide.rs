@@ -105,6 +105,7 @@ pub struct Decider {
     hunting: bool,                          // 有更高优先级的已保存网络当前不可见（或当前不可用 / 未连接）：引擎用更短的间隔扫描，等它一出现就连
     left_ssid: Option<String>,              // 最近一次非程序发起断开前所在的网络
     scan_done_at: i64,                      // 最近一次扫描完成的时间
+    fallback: Option<(Plan, i64)>,          // 预先算好的回落方案（“当前网络死了该去哪”）及其计算时间
     bad: BadMap,
 }
 
@@ -225,6 +226,7 @@ impl Decider {
             hunting: false,
             left_ssid: None,
             scan_done_at: 0,
+            fallback: None,
             bad: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -248,6 +250,11 @@ impl Decider {
     /// 引擎收到“扫描完成”通知：断线后用它判断刚才那个网络是不是真的没了（热点被关）。
     pub fn note_scan_done(&mut self, now: i64) {
         self.scan_done_at = now;
+    }
+
+    /// 预先算好的回落方案：引擎每轮取走，放进共享状态；引擎被系统调用卡住时由救援线程直接使用。
+    pub fn fallback_plan(&self) -> Option<(Plan, i64)> {
+        self.fallback.clone()
     }
 
     /// 引擎据此决定扫描间隔：true = 用更短的间隔扫描（热点一出现就能连上）。
@@ -514,6 +521,36 @@ impl Decider {
 
         order(&mut cands, policy, prefer24);
         let best_opt = cands.iter().find(|c| usable(c));
+
+        // 预先算好“如果当前网络死了，下一个去哪”：优先级最高、没被拉黑、有已保存配置、信号 >= 回落阈值的另一个网络。
+        // 不指定 BSSID（缓存里的接入点地址可能是旧的）。引擎被 WLAN 调用卡住时，救援线程直接用它。
+        self.fallback = cur.and_then(|cs| {
+            cands
+                .iter()
+                .find(|c| {
+                    c.ssid != cs
+                        && !is_bad(c)
+                        && !c.profile.is_empty()
+                        && (st.profiles.contains(&c.profile) || st.profiles.contains(&c.ssid))
+                        && c.signal >= s.down_threshold.max(s.min_connect_signal)
+                })
+                .map(|c| {
+                    (
+                        Plan {
+                            ssid: c.ssid.clone(),
+                            band: 0,
+                            iface: c.iface,
+                            profile: c.profile.clone(),
+                            bssid: None,
+                            reason: "引擎被系统调用卡住，由救援线程直接回落".to_string(),
+                            from_label: Some(label(cs, st.cur_band)),
+                            to_label: label(&c.ssid, c.band),
+                            retried: false,
+                        },
+                        now,
+                    )
+                })
+        });
 
         // 诊断：排在当前网络前面的候选被挡住时，说明原因（同一原因 30 秒最多一条），免得用户看不出“为什么没切”
         let held = match best_opt {

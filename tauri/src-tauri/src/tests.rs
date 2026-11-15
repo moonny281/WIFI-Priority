@@ -637,11 +637,16 @@ struct FakeHw {
     gw: Cell<Option<Ipv4Addr>>,
     ping_ok: Cell<bool>,
     wan: Cell<bool>,
+    blind: Cell<bool>, // true = 计数器读不到（读取线程被驱动 / 系统卡住了）
 }
 
 impl Hw for FakeHw {
     fn read_if(&self, _g: &[u8; 16]) -> Option<IfSnapshot> {
-        Some(self.snap.get())
+        if self.blind.get() {
+            None
+        } else {
+            Some(self.snap.get())
+        }
     }
     fn gateway(&self, _i: u32) -> Option<Ipv4Addr> {
         self.gw.get()
@@ -660,6 +665,7 @@ fn fake() -> FakeHw {
         gw: Cell::new(Some(Ipv4Addr::new(192, 168, 1, 1))),
         ping_ok: Cell::new(true),
         wan: Cell::new(true),
+        blind: Cell::new(false),
     }
 }
 
@@ -996,4 +1002,35 @@ fn t32_backoff_expiry_does_not_reconnect_to_ghost_that_was_never_seen_again() {
         }
     }
     assert_eq!(d.decide(&alive, &s, 20_100, false).connect.map(|p| p.ssid), Some("Hotspot".to_string()));
+}
+
+// ---------------- v1.2.2：监视线程不被卡住 / 预先算好的回落方案 ----------------
+#[test]
+fn l6_blind_when_counters_unavailable_still_detects_via_gateway_icmp() {
+    // 计数器读取线程被驱动卡住：监视线程不跟着卡，用上一份快照继续，直接去 ping 网关
+    let hw = fake();
+    let s = Settings::fresh(); // stall_ms = 1000
+    let mut st = LinkState::new("X", 0, 0);
+    assert_eq!(link::evaluate(&hw, &mut st, &G, &s, 0, false), Verdict::Healthy);
+    hw.blind.set(true);
+    hw.ping_ok.set(false);
+    hw.wan.set(false);
+    // 盲模式下看不到收发字节：只要距最后一次确认链路活着已经 stall_ms，就去验证网关
+    assert!(!matches!(link::evaluate(&hw, &mut st, &G, &s, 500, false), Verdict::LinkDead(_)));
+    assert!(matches!(link::evaluate(&hw, &mut st, &G, &s, 1000, false), Verdict::LinkDead(_)));
+    assert!(st.suspect);
+}
+
+#[test]
+fn t33_fallback_plan_is_precomputed_for_the_next_network() {
+    let mut d = Decider::new();
+    let s = cfg("Same", "5G", 0, &["Hotspot", "Home"]);
+    let w = st(Some(("Hotspot", 2, 80)), &[("Hotspot", 2, 80), ("Home", 2, 70)]);
+    d.decide(&w, &s, 1000, false);
+    let (plan, at) = d.fallback_plan().expect("当前连着热点：应预先算好回落到 Home 的方案");
+    assert_eq!((plan.ssid.as_str(), plan.bssid.is_none(), at), ("Home", true, 1000));
+    // 回落目标自己正在退避期：不能作为回落方案
+    d.unusable_handle().lock().unwrap().insert("Home".to_string(), Unusable { until: 100_000, level: 0, dead_at: 0 });
+    d.decide(&w, &s, 2000, false);
+    assert!(d.fallback_plan().is_none());
 }

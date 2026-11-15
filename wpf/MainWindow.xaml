@@ -383,6 +383,8 @@
                                       Style="{StaticResource Switch}" Margin="0,16,0,0" Click="Settings_Changed"/>
                             <CheckBox x:Name="SwInternet" Content="联网检测：网卡硬件链路 + 网关 + 公网分层检测，当前网络用不了时秒级回落到下一个网络"
                                       Style="{StaticResource Switch}" Margin="0,12,0,0" Click="Settings_Changed"/>
+                            <CheckBox x:Name="SwRescue" Content="救援回落：热点被突然关掉、系统 WLAN 服务卡住几秒时，由救援任务用独立句柄直接发起回落连接（需要开启联网检测）"
+                                      Style="{StaticResource Switch}" Margin="0,12,0,0" Click="Settings_Changed"/>
                             <Grid Margin="0,6">
                                 <TextBlock Text="等待更高优先级网络（如热点）出现时的扫描间隔（毫秒，越小热点一开越快连上；0 = 不加速）" VerticalAlignment="Center"/>
                                 <TextBox x:Name="TbHuntScan" Width="84" HorizontalAlignment="Right" TextAlignment="Right" LostFocus="Settings_Changed"/>
