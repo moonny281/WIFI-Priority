@@ -2,20 +2,11 @@
 
 use crate::model::*;
 use crate::util::unix_now;
-use crate::decide::Plan;
 use crate::link::CurLink;
 use crate::traffic::{self, Acct, TrafficSnap};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
-
-/// 预先算好的“当前网络死了该去哪”：引擎每轮正常决策后刷新。救援线程在引擎被系统调用卡住时直接用它发起回落连接。
-#[derive(Clone, Debug)]
-pub struct Fallback {
-    pub plan: Plan,
-    pub guid: Option<[u8; 16]>, // 目标所在网卡的 GUID（救援线程用独立句柄连接，不能依赖引擎句柄里的网卡序号）
-    pub made_at: i64,
-}
 
 pub struct Shared {
     pub settings: Mutex<Settings>,
@@ -30,12 +21,7 @@ pub struct Shared {
     pub mica: AtomicBool,
     pub main_open: AtomicBool,   // 主窗口当前是否存在（v1.1.9：关闭到托盘时窗口会被销毁以释放 WebView2 内存）
     pub cur_silent: AtomicBool,  // 当前接入点的帧时间戳很久没刷新（热点可能刚被关）：链路监视立刻去 ping 网关
-    pub tick_busy_since: AtomicI64, // 引擎当前这一轮开始的时间（0 = 空闲）：一轮超过 600 ms 说明被系统调用卡住了
-    pub tick_done_at: AtomicI64,    // 引擎最近一轮结束的时间
-    pub last_connect_at: AtomicI64, // 引擎最近一次发出连接请求的时间
-    pub rescued_at: AtomicI64,      // 救援线程最近一次发起回落连接的时间（0 = 没有）
     pub link_suspect: AtomicBool,   // 链路监视怀疑当前连接已经没有回音：引擎暂停扫描，别给正在出问题的驱动添乱
-    pub fallback: Mutex<Option<Fallback>>,
     pub switch_until: AtomicI64, // 程序刚发出连接请求：这个时间（毫秒）之前旧连接掉线是我们自己造成的，链路监视不评估、不判死
     pub scan_asap: AtomicI64,    // 断线类通知到来后，“最早可以立即扫描”的时间（毫秒，0 = 无）
     pub busy_bps: AtomicU64,     // 当前总流量（字节/秒）：大流量时不加速扫描，免得打断视频通话/下载
@@ -61,12 +47,7 @@ impl Shared {
             mica: AtomicBool::new(false),
             main_open: AtomicBool::new(false),
             cur_silent: AtomicBool::new(false),
-            tick_busy_since: AtomicI64::new(0),
-            tick_done_at: AtomicI64::new(0),
-            last_connect_at: AtomicI64::new(0),
-            rescued_at: AtomicI64::new(0),
             link_suspect: AtomicBool::new(false),
-            fallback: Mutex::new(None),
             switch_until: AtomicI64::new(0),
             scan_asap: AtomicI64::new(0),
             busy_bps: AtomicU64::new(0),

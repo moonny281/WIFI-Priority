@@ -770,15 +770,6 @@ fn l5_wan_down_needs_two_consecutive_failures() {
 }
 
 #[test]
-fn l6_backoff_is_exponential_and_capped() {
-    assert_eq!(link::backoff_ms(15, 0), 15_000);
-    assert_eq!(link::backoff_ms(15, 1), 30_000);
-    assert_eq!(link::backoff_ms(15, 2), 60_000);
-    assert_eq!(link::backoff_ms(15, 9), 300_000);
-    assert_eq!(link::backoff_ms(0, 3), 0); // 0 = 关闭退避（等同 v1.1.5 行为）
-}
-
-#[test]
 fn t23_driver_attempt_fail_notification_fails_fast() {
     let mut d = Decider::new();
     let s = cfg("Global", "5G", 0, &["A", "B"]);
@@ -806,13 +797,18 @@ fn t24_weak_signal_disconnect_does_not_wait_for_grace() {
 }
 
 #[test]
-fn t25_unusable_backoff_blocks_target_then_expires() {
+fn t25_dead_network_needs_scan_evidence_not_a_timer() {
+    // 判死过的网络没有任何计时器：不管过了多久，只要接入点在判死之后没被扫描更新过（幽灵条目）就不连；
+    // 一旦被扫描更新过（热点又开了）就立即连
     let mut d = Decider::new();
     let s = cfg("Same", "5G", 0, &["Hotspot", "Home"]);
-    d.unusable_handle().lock().unwrap().insert("Hotspot".to_string(), Unusable { until: 10_000, level: 0, dead_at: 0 });
-    let on_home = st(Some(("Home", 2, 70)), &[("Hotspot", 2, 80), ("Home", 2, 70)]);
-    assert!(d.decide(&on_home, &s, 9000, false).connect.is_none()); // 退避期内：不把它当作切换目标
-    assert_eq!(d.decide(&on_home, &s, 10_500, false).connect.map(|p| p.ssid), Some("Hotspot".to_string())); // 到期立即恢复
+    d.unusable_handle().lock().unwrap().insert("Hotspot".to_string(), Unusable { dead_at: 4_000 });
+    let mut w = st(Some(("Home", 2, 70)), &[("Hotspot", 2, 80), ("Home", 2, 70)]);
+    set_changed(&mut w, "Hotspot", 3_000); // 判死之后没有被扫描更新过
+    assert!(d.decide(&w, &s, 9_000, false).connect.is_none());
+    assert!(d.decide(&w, &s, 100_000, false).connect.is_none()); // 过再久也不连：没有新证据
+    set_changed(&mut w, "Hotspot", 100_500); // 被扫描更新了：证据到了
+    assert_eq!(d.decide(&w, &s, 101_000, false).connect.map(|p| p.ssid), Some("Hotspot".to_string()));
 }
 
 #[test]
@@ -827,6 +823,8 @@ fn s7_internet_check_default_on_migration() {
     // v1.2.0 迁移：还停留在旧默认值上的设置改成新默认值；用户自己改过的不动
     let s = Settings::from_json(r#"{"SchemaVersion":4,"StallMs":1500,"HeartbeatMs":2000,"DiscGraceMs":1200}"#).unwrap();
     assert_eq!((s.stall_ms, s.heartbeat_ms, s.disc_grace_ms), (1000, 1500, 400));
+    let s = Settings::from_json(r#"{"SchemaVersion":5,"WanIntervalSec":8}"#).unwrap();
+    assert_eq!(s.wan_interval_sec, 4); // v1.2.3：公网探测间隔 8 → 4 秒
     let s = Settings::from_json(r#"{"SchemaVersion":4,"StallMs":3000,"DiscGraceMs":2000}"#).unwrap();
     assert_eq!((s.stall_ms, s.disc_grace_ms), (3000, 2000));
 }
@@ -964,28 +962,30 @@ fn t30_link_monitor_verdict_skips_confirm_delay() {
 }
 
 #[test]
-fn t31_reappearing_network_clears_its_backoff() {
-    // 热点被判死后写了 15 秒退避；它消失又重新出现（用户关了又开）= 重启过，退避作废，立即连
+fn t31_reappearing_network_clears_its_dead_record() {
+    // 热点被判死后写了判死记录；它消失又重新出现（用户关了又开）= 重启过，记录作废，立即连
     let mut d = Decider::new();
     let s = cfg("Same", "5G", 0, &["Hotspot", "Home"]);
-    d.unusable_handle().lock().unwrap().insert("Hotspot".to_string(), Unusable { until: 100_000, level: 1, dead_at: 0 });
-    let w1 = st(Some(("Home", 2, 70)), &[("Hotspot", 2, 80), ("Home", 2, 70)]);
-    assert!(d.decide(&w1, &s, 1000, false).connect.is_none()); // 退避期内：不当作切换目标
+    d.unusable_handle().lock().unwrap().insert("Hotspot".to_string(), Unusable { dead_at: 1_000 });
+    let mut w1 = st(Some(("Home", 2, 70)), &[("Hotspot", 2, 80), ("Home", 2, 70)]);
+    set_changed(&mut w1, "Hotspot", 500); // 判死之后没更新过
+    assert!(d.decide(&w1, &s, 1500, false).connect.is_none());
     let w0 = st(Some(("Home", 2, 70)), &[("Home", 2, 70)]); // 热点消失
     d.decide(&w0, &s, 2000, false);
-    let p = d.decide(&w1, &s, 3000, false).connect.expect("重新出现后应立即连接");
+    let mut w2 = w1.clone();
+    set_changed(&mut w2, "Hotspot", 2_900); // 重新出现，接入点被扫描更新了
+    let p = d.decide(&w2, &s, 3000, false).connect.expect("重新出现后应立即连接");
     assert_eq!(p.ssid, "Hotspot");
     assert!(d.unusable_handle().lock().unwrap().get("Hotspot").is_none());
 }
 
-// ---------------- v1.2.1：日志里的 bug ----------------
 #[test]
 fn t32_backoff_expiry_does_not_reconnect_to_ghost_that_was_never_seen_again() {
     // 日志 13:33:15：热点已经关了，但缓存里的旧条目还没过期；退避 15 秒一到就切回热点，白白断网 10 秒。
     // 现在：退避到期后还要求它在判死之后又被扫描更新过
     let mut d = Decider::new();
     let s = cfg("Same", "5G", 0, &["Hotspot", "Home"]);
-    d.unusable_handle().lock().unwrap().insert("Hotspot".to_string(), Unusable { until: 5_000, level: 0, dead_at: 4_000 });
+    d.unusable_handle().lock().unwrap().insert("Hotspot".to_string(), Unusable { dead_at: 4_000 });
     let mut ghost = st(Some(("Home", 2, 70)), &[("Hotspot", 2, 80), ("Home", 2, 70)]);
     for n in ghost.nearby.iter_mut() {
         if n.ssid == "Hotspot" {
@@ -1019,18 +1019,4 @@ fn l6_blind_when_counters_unavailable_still_detects_via_gateway_icmp() {
     assert!(!matches!(link::evaluate(&hw, &mut st, &G, &s, 500, false), Verdict::LinkDead(_)));
     assert!(matches!(link::evaluate(&hw, &mut st, &G, &s, 1000, false), Verdict::LinkDead(_)));
     assert!(st.suspect);
-}
-
-#[test]
-fn t33_fallback_plan_is_precomputed_for_the_next_network() {
-    let mut d = Decider::new();
-    let s = cfg("Same", "5G", 0, &["Hotspot", "Home"]);
-    let w = st(Some(("Hotspot", 2, 80)), &[("Hotspot", 2, 80), ("Home", 2, 70)]);
-    d.decide(&w, &s, 1000, false);
-    let (plan, at) = d.fallback_plan().expect("当前连着热点：应预先算好回落到 Home 的方案");
-    assert_eq!((plan.ssid.as_str(), plan.bssid.is_none(), at), ("Home", true, 1000));
-    // 回落目标自己正在退避期：不能作为回落方案
-    d.unusable_handle().lock().unwrap().insert("Home".to_string(), Unusable { until: 100_000, level: 0, dead_at: 0 });
-    d.decide(&w, &s, 2000, false);
-    assert!(d.fallback_plan().is_none());
 }

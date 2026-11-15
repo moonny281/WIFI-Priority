@@ -465,11 +465,9 @@ namespace WifiPriority
             TbManualPause.Text = S.ManualPauseMinutes.ToString();
             SwTakeover.IsChecked = S.TakeoverUnlisted;
             SwInternet.IsChecked = S.InternetCheck;
-            SwRescue.IsChecked = S.RescueConnect;
             TbHuntScan.Text = S.HuntScanMs.ToString();
             TbStallMs.Text = S.StallMs.ToString();
             TbWanInterval.Text = S.WanIntervalSec.ToString();
-            TbBackoff.Text = S.UnusableBackoffSec.ToString();
             TbIpWait.Text = S.IpWaitMs.ToString();
             SwStale.IsChecked = S.StaleFilter;
             SwNotify.IsChecked = S.Notify;
@@ -509,12 +507,10 @@ namespace WifiPriority
             S.ManualPauseMinutes = ParseInt(TbManualPause, S.ManualPauseMinutes, 0, 1440);
             S.TakeoverUnlisted = SwTakeover.IsChecked == true;
             S.InternetCheck = SwInternet.IsChecked == true;
-            S.RescueConnect = SwRescue.IsChecked == true;
             S.HuntScanMs = ParseInt(TbHuntScan, S.HuntScanMs, 0, 10000);
             if (S.HuntScanMs != 0 && S.HuntScanMs < 300) S.HuntScanMs = 300;
             S.StallMs = ParseInt(TbStallMs, S.StallMs, 500, 10000);
             S.WanIntervalSec = ParseInt(TbWanInterval, S.WanIntervalSec, 2, 120);
-            S.UnusableBackoffSec = ParseInt(TbBackoff, S.UnusableBackoffSec, 0, 600);
             S.IpWaitMs = ParseInt(TbIpWait, S.IpWaitMs, 2000, 30000);
             S.StaleFilter = SwStale.IsChecked == true;
             S.Notify = SwNotify.IsChecked == true;

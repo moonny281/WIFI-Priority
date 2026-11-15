@@ -44,8 +44,6 @@ namespace WifiPriority.Services
         public Func<bool> IsSwitching;
         /// <summary>怀疑当前连接已经没有回音：引擎暂停扫描。</summary>
         public Action<bool> SetSuspect;
-        /// <summary>判死后通知引擎侧的救援任务：(ssid, 判死时刻 Environment.TickCount64)。</summary>
-        public Action<string, long> OnDeclaredDead;
         /// <summary>慢调用日志。</summary>
         public Action<string> LogSlow;
         /// <summary>判死：(ssid, 原因, 用时说明)。里面负责写 Decider 的不可用标记/退避表、置紧急扫描、唤醒引擎。</summary>
@@ -145,10 +143,11 @@ namespace WifiPriority.Services
                             _reported = true; _healthySince = 0;
                             string why = v == Verdict.NoInternet ? "已连接，网关可达但公网不通" : _why;
                             // 用判定完成的时刻算（探测本身要花一两秒，不能用这一轮开始的时刻）
-                            string took = _badSince > 0 ? $"距最后一次收到数据 {Now - _badSince} ms 判定" : "即时判定";
+                            // 公网不通是从“第一次公网探测失败”起算的；链路类判定才是从“最后一次收到数据”起算
+                            string took = _badSince > 0
+                                ? (v == Verdict.NoInternet ? $"首次公网探测失败后 {Now - _badSince} ms 判定" : $"距最后一次收到数据 {Now - _badSince} ms 判定")
+                                : "即时判定";
                             ReportUnusable?.Invoke(_ssid, why, took);
-                            // 引擎被 WLAN 调用卡住时，由救援任务直接发起回落连接（引擎没卡就什么都不做）
-                            OnDeclaredDead?.Invoke(_ssid, Environment.TickCount64);
                         }
                         _recheckAt = now + 2000;
                     }

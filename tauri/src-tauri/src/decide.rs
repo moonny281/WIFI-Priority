@@ -44,9 +44,9 @@ pub type BadMap = Arc<Mutex<HashMap<String, i64>>>;
 /// 链路监视线程多层证据确认“不可用”的网络：until 之前不参与选择（指数退避），之后立即恢复，不是永久拉黑。
 #[derive(Clone, Debug)]
 pub struct Unusable {
-    pub until: i64,
-    pub level: u32,
-    pub dead_at: i64, // 判死的时间：退避期过了以后，还要看到它的接入点在这之后又被扫描更新过，才算“真的还在”（缓存里的幽灵条目不算）
+    /// 判死的时间。没有任何计时器：之后只要这个网络的接入点被扫描更新过（时间戳在 dead_at 之后变化），就重新当作切换目标；
+    /// 没有更新（缓存里的幽灵条目，热点已经关了）就一直不连。
+    pub dead_at: i64,
 }
 pub type UnusableMap = Arc<Mutex<HashMap<String, Unusable>>>;
 
@@ -93,8 +93,7 @@ pub struct Decider {
     disc_at: i64, // 本次“未连接”状态开始的时间（0 = 当前不是未连接）
     not_before: i64, // 系统直接拒绝连接请求后，至少隔 3 秒再试（防止每 250 ms 空转，不是网络冷却）
     block_at: HashMap<String, i64>, // 连失败 / 非程序发起断开的网络 → 发生时间。之后必须被扫描到并更新过（有新证据）才允许再连
-    skip_ssid: Option<String>, // 断网状态下刚连失败的网络：15 秒内先试下一个，别在断网时只盯着它死磕
-    skip_until: i64,
+    skip_ssid: Option<String>, // 断网状态下刚连失败的网络：断网期间先试别的候选（连上任何网络后清除），别在断网时只盯着它死磕。没有计时器
     no_net: Arc<Mutex<Option<String>>>, // 当前连着、但检测不到互联网的 WiFi。离开它就清除，不留冷却
     unusable: UnusableMap, // 带退避的“暂不重试”表（链路监视线程写入）
     attempt_fail_at: i64,  // 最近一次收到驱动“连接请求失败”通知的时间（0 = 没有）
@@ -105,7 +104,6 @@ pub struct Decider {
     hunting: bool,                          // 有更高优先级的已保存网络当前不可见（或当前不可用 / 未连接）：引擎用更短的间隔扫描，等它一出现就连
     left_ssid: Option<String>,              // 最近一次非程序发起断开前所在的网络
     scan_done_at: i64,                      // 最近一次扫描完成的时间
-    fallback: Option<(Plan, i64)>,          // 预先算好的回落方案（“当前网络死了该去哪”）及其计算时间
     bad: BadMap,
 }
 
@@ -216,7 +214,6 @@ impl Decider {
             not_before: 0,
             block_at: HashMap::new(),
             skip_ssid: None,
-            skip_until: 0,
             no_net: Arc::new(Mutex::new(None)),
             unusable: Arc::new(Mutex::new(HashMap::new())),
             attempt_fail_at: 0,
@@ -226,7 +223,6 @@ impl Decider {
             hunting: false,
             left_ssid: None,
             scan_done_at: 0,
-            fallback: None,
             bad: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -250,11 +246,6 @@ impl Decider {
     /// 引擎收到“扫描完成”通知：断线后用它判断刚才那个网络是不是真的没了（热点被关）。
     pub fn note_scan_done(&mut self, now: i64) {
         self.scan_done_at = now;
-    }
-
-    /// 预先算好的回落方案：引擎每轮取走，放进共享状态；引擎被系统调用卡住时由救援线程直接使用。
-    pub fn fallback_plan(&self) -> Option<(Plan, i64)> {
-        self.fallback.clone()
     }
 
     /// 引擎据此决定扫描间隔：true = 用更短的间隔扫描（热点一出现就能连上）。
@@ -366,7 +357,6 @@ impl Decider {
                     self.block_at.insert(lp.ssid.clone(), now);
                     if !st.connected {
                         self.skip_ssid = Some(lp.ssid.clone());
-                        self.skip_until = now + 15_000;
                     }
                 }
                 self.last_plan = None;
@@ -474,15 +464,26 @@ impl Decider {
                 }
             }
         };
-        let skip: Option<String> = if !st.connected && now < self.skip_until { self.skip_ssid.clone() } else { None };
+        // 断网状态下刚连失败的网络：只要还有别的候选（有已保存配置、信号够），就先试别的；没有别的候选就不跳过它（不能把自己困死）。
+        // 连上任何网络后清除——之后它能不能再连，只看扫描证据（block_at）。没有计时器。
+        if st.connected {
+            self.skip_ssid = None;
+        }
+        let skip: Option<String> = match (&self.skip_ssid, st.connected) {
+            (Some(sk), false) => {
+                let has_alt = cands.iter().any(|c| &c.ssid != sk && st.profiles.contains(&c.ssid) && c.signal >= s.down_threshold);
+                if has_alt { Some(sk.clone()) } else { None }
+            }
+            _ => None,
+        };
         let unusable = self.unusable.lock().unwrap().clone();
         let is_bad = |c: &Cand| -> bool {
             is_bad_key(&bad, &c.key(), now)
                 || no_net.as_deref() == Some(c.ssid.as_str())
                 || skip.as_deref() == Some(c.ssid.as_str())
-                // 判死过的网络：退避期内不当作切换目标；退避期过了还要求它在判死之后又被扫描更新过（热点关掉后，
-                // 缓存里的旧条目要好几次扫描才会过期，不能因为退避到期就去连一个已经不在的幽灵）。当前连着的由 no_net 负责。
-                || (!is_current(c) && unusable.get(&c.ssid).map_or(false, |u| u.until > now || unseen_since(c, u.dead_at, now)))
+                // 判死过的网络：只看扫描证据——它的接入点在判死之后被扫描更新过，才重新当作切换目标（没有任何计时器）。
+                // 热点关掉后缓存里的旧条目要好几次扫描才会过期，没有更新就是幽灵，不能去连。当前连着的由 no_net 负责。
+                || (!is_current(c) && unusable.get(&c.ssid).map_or(false, |u| unseen_since(c, u.dead_at, now)))
                 || blocked(c)
         };
 
@@ -522,35 +523,6 @@ impl Decider {
         order(&mut cands, policy, prefer24);
         let best_opt = cands.iter().find(|c| usable(c));
 
-        // 预先算好“如果当前网络死了，下一个去哪”：优先级最高、没被拉黑、有已保存配置、信号 >= 回落阈值的另一个网络。
-        // 不指定 BSSID（缓存里的接入点地址可能是旧的）。引擎被 WLAN 调用卡住时，救援线程直接用它。
-        self.fallback = cur.and_then(|cs| {
-            cands
-                .iter()
-                .find(|c| {
-                    c.ssid != cs
-                        && !is_bad(c)
-                        && !c.profile.is_empty()
-                        && (st.profiles.contains(&c.profile) || st.profiles.contains(&c.ssid))
-                        && c.signal >= s.down_threshold.max(s.min_connect_signal)
-                })
-                .map(|c| {
-                    (
-                        Plan {
-                            ssid: c.ssid.clone(),
-                            band: 0,
-                            iface: c.iface,
-                            profile: c.profile.clone(),
-                            bssid: None,
-                            reason: "引擎被系统调用卡住，由救援线程直接回落".to_string(),
-                            from_label: Some(label(cs, st.cur_band)),
-                            to_label: label(&c.ssid, c.band),
-                            retried: false,
-                        },
-                        now,
-                    )
-                })
-        });
 
         // 诊断：排在当前网络前面的候选被挡住时，说明原因（同一原因 30 秒最多一条），免得用户看不出“为什么没切”
         let held = match best_opt {

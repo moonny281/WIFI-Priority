@@ -46,8 +46,6 @@ namespace WifiPriority.Services
         /// <summary>ACM 与 MSM 的通知码数值有重叠（如 ACM 7 = 扫描完成，MSM 7 = 无线电状态变化），所以给 MSM 来源的码打标记；ACM 来源保持原值。</summary>
         public const uint MsmFlag = 0x10000;
         public const uint AcmConnectionAttemptFail = 11;
-        /// <summary>最近一次 ACM connection_complete（码 10）的时间（Environment.TickCount64）：由通知回调直接记录（不经过引擎线程），救援任务据此判断判死之后有没有连接已经完成。</summary>
-        public static long LastConnCompleteTick;   // 连接请求失败：驱动毫秒级就会通知，不必再傻等 SettleMs
         const uint ErrAccessDenied = 5;
         const int IfaceInfoSize = 532;   // WLAN_INTERFACE_INFO：GUID(16) + WCHAR[256] + state(4)
         const int AvailNetSize = 628;    // WLAN_AVAILABLE_NETWORK
@@ -87,17 +85,6 @@ namespace WifiPriority.Services
             catch { _h = IntPtr.Zero; return false; }
         }
 
-        /// <summary>独立句柄（救援任务用）：不注册通知，只用来发连接请求。引擎的句柄可能正阻塞在某个 WLAN 调用里，救援要绕开它。</summary>
-        public bool OpenQuiet()
-        {
-            try
-            {
-                if (WlanOpenHandle(2, IntPtr.Zero, out _, out _h) != 0) { _h = IntPtr.Zero; return false; }
-                return true;
-            }
-            catch { _h = IntPtr.Zero; return false; }
-        }
-
         void OnNotify(IntPtr data, IntPtr ctx)
         {
             try
@@ -105,7 +92,6 @@ namespace WifiPriority.Services
                 if (data == IntPtr.Zero) return;
                 uint src = (uint)Marshal.ReadInt32(data, 0);
                 uint code = (uint)Marshal.ReadInt32(data, 4);
-                if (src == SourceAcm && code == 10) System.Threading.Interlocked.Exchange(ref LastConnCompleteTick, Environment.TickCount64);
                 uint tagged = src == SourceAcm ? code : src == SourceMsm ? (code | MsmFlag) : uint.MaxValue;
                 if (tagged == uint.MaxValue) return;
                 Notified?.Invoke(tagged);

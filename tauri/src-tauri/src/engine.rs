@@ -258,17 +258,7 @@ impl<H: Host> Engine<H> {
     }
 
     /// 一轮：读状态 → 决策 → 执行。返回下一轮前的等待毫秒数。
-    /// 一轮：外面包一层，记录“这一轮什么时候开始 / 结束”——救援线程据此判断引擎是不是被系统调用卡住了。
     fn tick(&mut self) -> u64 {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.sh.tick_busy_since.store(now_ms().max(1), Relaxed);
-        let w = self.tick_inner();
-        self.sh.tick_done_at.store(now_ms(), Relaxed);
-        self.sh.tick_busy_since.store(0, Relaxed);
-        w
-    }
-
-    fn tick_inner(&mut self) -> u64 {
         let t0 = Instant::now();
         let s = self.sh.settings.lock().unwrap().clone();
 
@@ -328,13 +318,6 @@ impl<H: Host> Engine<H> {
 
         let t_d = Instant::now();
         let dec = self.dec.decide(&st, &s, now_ms(), self.sh.is_paused());
-        // 把预先算好的回落方案放进共享状态：引擎被系统调用卡住时，救援线程直接用它
-        if let Ok(mut g) = self.sh.fallback.lock() {
-            *g = self.dec.fallback_plan().map(|(plan, at)| {
-                let guid = self.client.as_ref().and_then(|c| c.iface_guid(plan.iface));
-                crate::state::Fallback { plan, guid, made_at: at }
-            });
-        }
         for l in &dec.logs {
             self.log(l);
         }
@@ -382,7 +365,6 @@ impl<H: Host> Engine<H> {
     fn execute(&mut self, plan: &Plan, t0: Instant) {
         // 从现在起 3 秒内旧连接掉线是我们自己造成的：链路监视不评估、不判死（否则会把刚离开的好网络写进退避）
         self.sh.switch_until.store(now_ms() + 3000, std::sync::atomic::Ordering::Relaxed);
-        self.sh.last_connect_at.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
         self.log(&format!(
             "切换：{} → {}（{}）",
             plan.from_label.as_deref().unwrap_or("(未连接)"),

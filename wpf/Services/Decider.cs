@@ -64,10 +64,11 @@ namespace WifiPriority.Services
         long _notBefore;            // 系统直接拒绝连接请求后，至少隔 3 秒再试（防止每 250 ms 空转，不是网络冷却）
         // 连失败 / 非程序发起断开的网络 → 发生时间。之后必须被扫描到并更新过（有新证据）才允许再连
         readonly Dictionary<string, long> _blockAt = new Dictionary<string, long>();
-        string _skipSsid;           // 断网状态下刚连失败的网络：15 秒内先试下一个，别在断网时只盯着它死磕（连上任何网络后失效）
-        long _skipUntil;
+        string _skipSsid;           // 断网状态下刚连失败的网络：断网期间先试别的候选，别只盯着它死磕（连上任何网络后清除）。没有计时器
         // v1.1.8：链路监视确认“不可用”的网络 → 带指数退避的“暂不重试”（until 之前不当作切换目标，之后立即恢复，不是永久拉黑）
-        readonly Dictionary<string, (long Until, int Level, long DeadAt)> _unusable = new Dictionary<string, (long Until, int Level, long DeadAt)>();   // DeadAt：判死的时间，退避期过了还要看到它在这之后又被扫描更新过
+        // 判死记录：ssid → 判死的时间。没有任何计时器：之后只要这个网络的接入点被扫描更新过（时间戳在判死之后变化），就重新当作切换目标；
+        // 没有更新（缓存里的幽灵条目，热点已经关了）就一直不连。
+        readonly Dictionary<string, long> _unusable = new Dictionary<string, long>();
         // v1.1.9：热点“刚出现”/“刚关掉”要立刻反应
         bool _visInit;                                   // 是否已经有过一轮可见性记录（程序刚启动时已在场的网络不算“刚出现”）
         HashSet<string> _vis = new HashSet<string>();    // 上一轮可见（未过期）的列表内网络
@@ -75,41 +76,21 @@ namespace WifiPriority.Services
         bool _hunting;                                   // 有更高优先级的已保存网络当前不可见（或当前不可用 / 未连接）：引擎用更短间隔扫描
         string _leftSsid;                                // 最近一次非程序发起断开前所在的网络
         long _scanDoneAt;
-        Plan _fallback; long _fallbackAt;                // 预先算好的回落方案（“当前网络死了该去哪”）及其计算时间
         long _attemptFailAt;        // 最近一次收到驱动“连接请求失败”通知的时间（0 = 没有）
 
         /// <summary>联网检测报告：当前连着的这个网络无法上网 → 本轮决策把它当作不可用，回退到下一个。</summary>
         public void ReportNoInternet(string ssid) { _noNet = ssid; }
 
-        /// <summary>链路监视确认当前网络不可用：标记为不可用（Decider 立即回落），并写入带指数退避的“暂不重试”表。返回退避毫秒数。</summary>
-        public long ReportUnusable(string ssid, long now, int baseSec)
+        /// <summary>链路监视确认当前网络不可用：标记为不可用（Decider 立即回落），并记下判死的时间。没有任何计时器：之后只看扫描证据。</summary>
+        public void ReportUnusable(string ssid, long now)
         {
-            long wait = Backoff(baseSec, 0);
-            lock (_unusable)
-            {
-                int level = _unusable.TryGetValue(ssid, out var u) ? u.Level + 1 : 0;
-                wait = Backoff(baseSec, level);
-                _unusable[ssid] = (now + wait, level, now);
-            }
+            lock (_unusable) _unusable[ssid] = now;
             _noNet = ssid;
-            return wait;
         }
 
-        /// <summary>健康满一段时间后清零该网络的退避等级。</summary>
+        /// <summary>健康满一段时间后清掉该网络的判死记录。</summary>
         public void ClearUnusable(string ssid) { lock (_unusable) _unusable.Remove(ssid); }
 
-        /// <summary>该网络当前的退避等级（0 起；没有记录 = -1），日志用。</summary>
-        public int UnusableLevel(string ssid) { lock (_unusable) return _unusable.TryGetValue(ssid, out var u) ? u.Level : -1; }
-
-        /// <summary>15→30→60→120→240→300 秒；baseSec &lt;= 0 = 关闭退避。</summary>
-        public static long Backoff(int baseSec, int level)
-        {
-            if (baseSec <= 0) return 0;
-            long ms = baseSec * 1000L * (1L << Math.Min(level, 5));
-            return Math.Min(ms, 300000);
-        }
-
-        /// <summary>引擎收到驱动的“连接请求失败”通知（ACM 11）：不再等满 SettleMs，下一轮评估就按失败处理。</summary>
         /// <summary>这个候选的接入点在 t 时刻之后还没有被扫描更新过（= 可能已经不在了）。与“断开后拉黑”同一套判据。</summary>
         static bool UnseenSince(Cand c, long t, long now)
         {
@@ -120,15 +101,6 @@ namespace WifiPriority.Services
 
         /// <summary>引擎收到“扫描完成”通知：断线后用它判断原网络是不是真的没了（热点被关）。</summary>
         public void NoteScanDone(long now) { _scanDoneAt = now; }
-
-        /// <summary>该网络当前是否还在退避期里（救援任务用）。</summary>
-        public bool IsInBackoff(string ssid, long now)
-        {
-            lock (_unusable) return _unusable.TryGetValue(ssid, out var u) && u.Until > now;
-        }
-
-        /// <summary>预先算好的回落方案：引擎每轮取走；引擎被系统调用卡住时由救援任务直接使用。</summary>
-        public (Plan Plan, long At)? FallbackPlan => _fallback == null ? ((Plan, long)?)null : (_fallback, _fallbackAt);
 
         /// <summary>引擎据此决定扫描间隔：true = 用更短的间隔扫描（热点一出现就能连上）。</summary>
         public bool Hunting => _hunting;
@@ -270,7 +242,7 @@ namespace WifiPriority.Services
                         // 唯一的例外：断网状态下，先让下一个候选试一次，别在断网时只盯着失败的那个死磕。
                         d.Logs.Add($"连接 {_lastPlan.Ssid} 没有成功，等扫描确认它还在再重试");
                         _blockAt[_lastPlan.Ssid] = now;
-                        if (cur == null) { _skipSsid = _lastPlan.Ssid; _skipUntil = now + 15000; }
+                        if (cur == null) _skipSsid = _lastPlan.Ssid;
                     }
                     _lastPlan = null;
                 }
@@ -346,14 +318,19 @@ namespace WifiPriority.Services
                 if (c.SeenAt < 0) return now - blockedAt < 20000;    // 驱动没给时间戳，无法求证：退化为 20 秒间隔
                 return true;                                 // 0 = 启动时缓存里的、从未观察到更新：不算证据
             }
-            Dictionary<string, (long Until, int Level, long DeadAt)> unusable;
-            lock (_unusable) unusable = new Dictionary<string, (long Until, int Level, long DeadAt)>(_unusable);
+            // 断网状态下刚连失败的网络：只要还有别的候选（有已保存配置、信号够），就先试别的；没有别的候选就不跳过它（不能把自己困死）。
+            // 连上任何网络后清除——之后它能不能再连，只看扫描证据。没有计时器。
+            if (st.Connected) _skipSsid = null;
+            bool skipActive = _skipSsid != null && !st.Connected
+                && cands.Any(sc => sc.Ssid != _skipSsid && st.Profiles.Contains(sc.Ssid) && sc.Signal >= s.DownThreshold);
+            Dictionary<string, long> unusable;
+            lock (_unusable) unusable = new Dictionary<string, long>(_unusable);
             // 判死过的网络：退避期内不当作切换目标（当前连着的由 _noNet 负责）
-            // 判死过的网络：退避期内不当作切换目标；退避期过了还要求它在判死之后又被扫描更新过（热点关掉后，
-            // 缓存里的旧条目要好几次扫描才会过期，不能因为退避到期就去连一个已经不在的幽灵）。当前连着的由 _noNet 负责。
-            bool InBackoff(Cand c) => !IsCurrent(c) && unusable.TryGetValue(c.Ssid, out var u) && (u.Until > now || UnseenSince(c, u.DeadAt, now));
+            // 判死过的网络：只看扫描证据——它的接入点在判死之后被扫描更新过，才重新当作切换目标（没有任何计时器）。
+            // 热点关掉后缓存里的旧条目要好几次扫描才会过期，没有更新就是幽灵，不能去连。当前连着的由 _noNet 负责。
+            bool InBackoff(Cand c) => !IsCurrent(c) && unusable.TryGetValue(c.Ssid, out var deadAt) && UnseenSince(c, deadAt, now);
             bool IsBad(Cand c) => IsBadKey(c.Key, now) || (_noNet != null && c.Ssid == _noNet) || Blocked(c) || InBackoff(c)
-                || (cur == null && _skipSsid != null && c.Ssid == _skipSsid && now < _skipUntil);
+                || (cur == null && skipActive && c.Ssid == _skipSsid);
 
             var curCand = cands.Where(IsCurrent).OrderByDescending(c => c.Signal).FirstOrDefault();
             bool curListed = cur != null && pri.Contains(cur);
@@ -395,26 +372,6 @@ namespace WifiPriority.Services
 
             var ordered = Order(cands, policy, prefer24).ToList();
             var best = ordered.FirstOrDefault(Usable);
-
-            // 预先算好“如果当前网络死了，下一个去哪”：优先级最高、没被拉黑、有已保存配置、信号 >= 回落阈值的另一个网络。
-            // 不指定 BSSID（缓存里的接入点地址可能是旧的）。引擎被 WLAN 调用卡住时，救援任务直接用它。
-            _fallback = null;
-            if (cur != null)
-            {
-                var fbc = ordered.FirstOrDefault(fc => fc.Ssid != cur && !IsBad(fc) && !string.IsNullOrEmpty(fc.Profile)
-                    && (st.Profiles.Contains(fc.Profile) || st.Profiles.Contains(fc.Ssid))
-                    && fc.Signal >= Math.Max(s.DownThreshold, s.MinConnectSignal));
-                if (fbc != null)
-                {
-                    _fallback = new Plan
-                    {
-                        Ssid = fbc.Ssid, Band = 0, Bssid = null, Iface = fbc.Iface, Profile = fbc.Profile,
-                        Reason = "引擎被系统调用卡住，由救援任务直接回落",
-                        FromLabel = Label(cur, st.CurBand), ToLabel = Label(fbc.Ssid, fbc.Band),
-                    };
-                    _fallbackAt = now;
-                }
-            }
 
             // 诊断：排在当前网络前面的候选被挡住时，说明原因（30 秒最多一条），免得用户看不出“为什么没切”
             bool held = best == null || IsCurrent(best);

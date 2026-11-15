@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 
-pub const CURRENT_SCHEMA: i64 = 5;
+pub const CURRENT_SCHEMA: i64 = 6;
 
 /// 启动时从旧配置迁移过“频段策略”（Global → Same）的标记，引擎启动后写一条日志告知用户。
 pub static BAND_POLICY_MIGRATED: AtomicBool = AtomicBool::new(false);
@@ -35,12 +35,10 @@ pub struct Settings {
     pub wan_interval_sec: i64,     // 健康时公网探测间隔
     pub wan_timeout_ms: i64,       // 单次公网探测超时
     pub ip_wait_ms: i64,           // 刚连上后等 DHCP/网关的上限
-    pub unusable_backoff_sec: i64, // 判死后退避基数（15→30→60→…→300 秒），0 = 关闭退避
     pub disc_grace_ms: i64,        // 断开后的让路窗口（信号弱 / 扫描证明原网络已消失时自动为 0）
     // v1.1.9
     pub hunt_scan_ms: i64,         // 有更高优先级网络“还没出现”时的扫描间隔（毫秒；热点一开就能连上）；0 = 不加速，沿用 ScanIntervalSec
     pub overlay_show_traffic: bool, // 悬浮框显示实时流量与用量
-    pub rescue_connect: bool,       // v1.2.2：引擎被 WLAN 调用卡住时，判死后由救援线程用独立句柄直接发起回落连接
     pub overlay_native: bool,       // v1.2.0：悬浮框用原生窗口（GDI）绘制，不创建 WebView2——后台内存占用低一个数量级；关掉则用网页版悬浮框
     pub notify: bool,
 
@@ -80,14 +78,12 @@ impl Default for Settings {
             internet_check: true,
             stall_ms: 1000,
             heartbeat_ms: 1500,
-            wan_interval_sec: 8,
+            wan_interval_sec: 4,
             wan_timeout_ms: 900,
             ip_wait_ms: 8000,
-            unusable_backoff_sec: 15,
             disc_grace_ms: 400,
             hunt_scan_ms: 1500,
             overlay_show_traffic: true,
-            rescue_connect: true,
             overlay_native: true,
             notify: true,
             band_policy: "Same".into(),
@@ -149,6 +145,11 @@ impl Settings {
                     s.disc_grace_ms = 400;
                 }
             }
+            // v1.2.3：热点关闭时常常是手机先断上游、接入点还活着一小会儿——网关 ICMP 通、只有公网探测会失败，
+            // 所以公网探测间隔 8 → 4 秒（探测只是三个 TCP 握手，开销可以忽略）。只迁移还停留在旧默认值上的设置。
+            if s.schema_version < 6 && s.wan_interval_sec == 8 {
+                s.wan_interval_sec = 4;
+            }
             s.schema_version = CURRENT_SCHEMA;
         }
         s.sanitize();
@@ -172,7 +173,6 @@ impl Settings {
         self.wan_interval_sec = self.wan_interval_sec.clamp(2, 120);
         self.wan_timeout_ms = self.wan_timeout_ms.clamp(300, 5_000);
         self.ip_wait_ms = self.ip_wait_ms.clamp(2_000, 30_000);
-        self.unusable_backoff_sec = self.unusable_backoff_sec.clamp(0, 600);
         self.disc_grace_ms = self.disc_grace_ms.clamp(0, 5_000);
         if self.hunt_scan_ms != 0 {
             self.hunt_scan_ms = self.hunt_scan_ms.clamp(300, 10_000);

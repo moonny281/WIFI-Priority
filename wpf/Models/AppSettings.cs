@@ -22,14 +22,12 @@ namespace WifiPriority.Models
         // v1.1.8 链路健康检测（硬件读数 + 网关 + 公网分层检测）；字段名与 Tauri 版一致，两版共用 settings.json
         public int StallMs { get; set; } = 1000;           // 距最后一次收到数据多久算“怀疑”（墙钟）
         public int HeartbeatMs { get; set; } = 1500;       // 完全空闲时，多久没收到任何数据就去 ping 一次网关
-        public int WanIntervalSec { get; set; } = 8;       // 健康时公网探测间隔
+        public int WanIntervalSec { get; set; } = 4;       // 健康时公网探测间隔
         public int WanTimeoutMs { get; set; } = 900;       // 单次公网探测超时
         public int IpWaitMs { get; set; } = 8000;          // 刚连上后等 DHCP/网关的上限
-        public int UnusableBackoffSec { get; set; } = 15;  // 判死后退避基数（15→30→…→300 秒），0 = 关闭退避
         public int DiscGraceMs { get; set; } = 400;        // 断开后的让路窗口（信号弱 / 扫描证明原网络已消失时自动为 0）
         // v1.1.9
         public int HuntScanMs { get; set; } = 1500;        // 有更高优先级网络“还没出现”时的扫描间隔（毫秒；热点一开就能连上）；0 = 不加速，沿用 ScanIntervalSec
-        public bool RescueConnect { get; set; } = true;    // v1.2.2：引擎被 WLAN 调用卡住时，判死后由救援任务用独立句柄直接发起回落连接
         public bool OverlayShowTraffic { get; set; } = true;   // 悬浮框显示实时流量与用量
         public bool Notify { get; set; } = true;           // 切换时弹出托盘通知
 
@@ -60,7 +58,7 @@ namespace WifiPriority.Models
 
     public static class SettingsStore
     {
-        const int CurrentSchema = 5;
+        const int CurrentSchema = 6;
 
         /// <summary>启动时把旧配置里的“频段策略”从 Global 迁移成了 Same（引擎启动后写一条日志告知用户）。</summary>
         public static bool BandPolicyMigrated;
@@ -114,6 +112,9 @@ namespace WifiPriority.Models
                                 if (s.HeartbeatMs == 2000) s.HeartbeatMs = 1500;
                                 if (s.DiscGraceMs == 1200) s.DiscGraceMs = 400;
                             }
+                            // v1.2.3：热点关闭时常常是手机先断上游、接入点还活着一小会儿——网关 ICMP 通、只有公网探测会失败，
+                            // 所以公网探测间隔 8 → 4 秒。只迁移还停留在旧默认值上的设置
+                            if (s.SchemaVersion < 6 && s.WanIntervalSec == 8) s.WanIntervalSec = 4;
                             s.SchemaVersion = CurrentSchema;
                         }
                         Sanitize(s);
@@ -135,7 +136,6 @@ namespace WifiPriority.Models
             s.WanIntervalSec = Clamp(s.WanIntervalSec, 2, 120);
             s.WanTimeoutMs = Clamp(s.WanTimeoutMs, 300, 5000);
             s.IpWaitMs = Clamp(s.IpWaitMs, 2000, 30000);
-            s.UnusableBackoffSec = Clamp(s.UnusableBackoffSec, 0, 600);
             s.DiscGraceMs = Clamp(s.DiscGraceMs, 0, 5000);
             if (s.HuntScanMs != 0) s.HuntScanMs = Clamp(s.HuntScanMs, 300, 10000);
         }

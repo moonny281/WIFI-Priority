@@ -432,16 +432,10 @@ pub fn evaluate<H: Hw>(hw: &H, st: &mut LinkState, guid: &[u8; 16], s: &Settings
     Verdict::Pending
 }
 
-pub fn backoff_ms(base_sec: i64, level: u32) -> i64 {
-    if base_sec <= 0 {
-        return 0;
-    }
-    (base_sec * 1000).saturating_mul(1i64 << level.min(5)).min(300_000) // 15→30→60→120→240→300 秒
-}
 
 /// 链路监视线程：事件（通知）一来立即跑一轮，否则每 250 ms 一轮（平时只读硬件计数器，不发包）。
 ///  - no_net：现有句柄，标记“当前网络不可用”，Decider 据此立即回落；
-///  - unusable：带退避的“暂不重试”表（只在多层证据确认判死后写入，unusable_backoff_sec = 0 即关闭）。
+///  - unusable：判死记录（只记判死的时间，没有计时器：之后只看扫描证据——接入点被更新过才重新当作切换目标）。
 pub fn spawn_monitor(
     sh: Arc<Shared>,
     cur: Arc<Mutex<Option<CurLink>>>,
@@ -531,30 +525,24 @@ pub fn spawn_monitor(
                 if !st.reported {
                     st.reported = true;
                     st.healthy_since = 0;
-                    let (level, wait) = {
-                        let mut map = unusable.lock().unwrap();
-                        let level = map.get(&c.ssid).map(|u| u.level + 1).unwrap_or(0);
-                        let wait = backoff_ms(s.unusable_backoff_sec, level);
-                        map.insert(c.ssid.clone(), Unusable { until: now + wait, level, dead_at: now });
-                        (level, wait)
-                    };
+                    // 不设任何计时器：记下判死的时间，之后只看扫描证据（接入点在这之后被更新过才重新当作切换目标）
+                    unusable.lock().unwrap().insert(c.ssid.clone(), Unusable { dead_at: now });
                     *no_net.lock().unwrap() = Some(c.ssid.clone());
                     sh.urgent_scan.store(true, Ordering::Relaxed); // 立刻扫描，别等 scan_interval
                     let took = if st.bad_since > 0 {
-                        // 用判定完成的时刻算（探测本身要花一两秒，不能用这一轮开始的时刻）
-                        format!("距最后一次收到数据 {} ms 判定", now_ms() - st.bad_since)
+                        // 用判定完成的时刻算（探测本身要花一两秒，不能用这一轮开始的时刻）。
+                        // 公网不通是从“第一次公网探测失败”起算的；链路类判定才是从“最后一次收到数据”起算。
+                        if verdict == Verdict::NoInternet {
+                            format!("首次公网探测失败后 {} ms 判定", now_ms() - st.bad_since)
+                        } else {
+                            format!("距最后一次收到数据 {} ms 判定", now_ms() - st.bad_since)
+                        }
                     } else {
                         "即时判定".to_string()
                     };
-                    let again = if wait > 0 {
-                        format!("{} 秒内不会再把它当作切换目标（第 {} 次）", wait / 1000, level + 1)
-                    } else {
-                        "未启用退避，它重新成为最优时会再次尝试".to_string()
-                    };
-                    log(&format!("{} 不可用：{}（{}），回落到下一个网络；{}", c.ssid, why, took, again));
+                    log(&format!("{} 不可用：{}（{}），回落到下一个网络；扫描确认它的接入点又被更新（还在）后才会再次尝试", c.ssid, why, took));
                     sh.wake();
-                    // 引擎被 WLAN 调用卡住时，由救援线程直接发起回落连接（引擎没卡就什么都不做）
-                    crate::rescue::spawn(sh.clone(), c.ssid.clone(), now_ms(), unusable.clone(), log.clone());
+
                 }
                 st.recheck_at = now + 2000;
             }

@@ -51,8 +51,6 @@ const SOURCE_MSM: u32 = 0x10;
 /// ACM 与 MSM 的通知码数值有重叠（如 ACM 7 = 扫描完成，MSM 7 = 无线电状态变化），所以给 MSM 来源的码打标记；
 /// ACM 来源的码保持原值，引擎里现有的 note(7/8) 逻辑不受影响。
 pub const MSM_FLAG: u32 = 0x1_0000;
-/// 最近一次 ACM connection_complete（码 10）的时间：由通知回调直接记录（不经过引擎线程），救援线程据此判断判死之后有没有连接已经完成。
-pub static LAST_CONN_COMPLETE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 pub const ACM_CONNECTION_ATTEMPT_FAIL: u32 = 11; // 连接请求失败：驱动毫秒级就会通知，不必再傻等 SETTLE_MS
 #[allow(dead_code)]
 pub const MSM_DISASSOCIATING: u32 = 9 | MSM_FLAG;
@@ -76,9 +74,6 @@ unsafe extern "system" fn on_notify(data: *mut c_void, _ctx: *mut c_void) {
     let p = data as *const u8;
     let src = read_unaligned(p as *const u32);
     let code = read_unaligned(p.add(4) as *const u32);
-    if src == SOURCE_ACM && code == 10 {
-        LAST_CONN_COMPLETE.store(crate::util::now_ms(), std::sync::atomic::Ordering::Relaxed);
-    }
     let tagged = match src {
         SOURCE_ACM => code,
         SOURCE_MSM => code | MSM_FLAG,
@@ -185,27 +180,6 @@ impl Client {
             };
             c.refresh_ifaces();
             Some(c)
-        }
-    }
-
-    /// 独立句柄（救援线程用）：不注册通知、不碰全局通知通道，只用来发连接请求。
-    /// 引擎的句柄可能正阻塞在某个 WLAN 调用里，救援线程要绕开它。
-    pub fn open_quiet() -> Option<Client> {
-        unsafe {
-            let mut h: *mut c_void = null_mut();
-            let mut neg = 0u32;
-            if WlanOpenHandle(2, null_mut(), &mut neg, &mut h) != 0 || h.is_null() {
-                return None;
-            }
-            Some(Client {
-                h,
-                ifaces: Vec::new(),
-                iface_at: Instant::now(),
-                slow: Vec::new(),
-                profiles: HashSet::new(),
-                profiles_at: None,
-                broken: false,
-            })
         }
     }
 

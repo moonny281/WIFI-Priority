@@ -17,7 +17,6 @@ export interface Settings {
   HuntScanMs: number;
   OverlayShowTraffic: boolean;
   OverlayNative: boolean;
-  RescueConnect: boolean;
   StallMs: number;
   HeartbeatMs: number;
   WanIntervalSec: number;
